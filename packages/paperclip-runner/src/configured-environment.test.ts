@@ -1,4 +1,4 @@
-import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, configuredEnvironmentProjection } from './configured-environment.js';
+import { CERTIFICATE_ENVIRONMENT_KEYS, CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, configuredEnvironmentProjection } from './configured-environment.js';
 import { describe, expect, it, vi } from 'vitest';
 import { createSanitizedCodexEnvironment } from './drivers/codex/app-server-transport.js';
 import { createIsolatedCodexAppServerArgs } from './drivers/codex/codex-security-config.js';
@@ -131,4 +131,17 @@ describe("configured environment authority", () => {
       }
     } finally { vi.unstubAllEnvs(); }
   });
+});
+
+it("preserves sandbox certificate trust injected after policy construction", async () => {
+  const args = createIsolatedCodexAppServerArgs({ PATH: "/bin" });
+  const setting = args.find(value => value.startsWith("shell_environment_policy.include_only="))!;
+  const keys = JSON.parse(setting.slice(setting.indexOf("=") + 1)) as string[];
+  expect(keys).toEqual(expect.arrayContaining([...CERTIFICATE_ENVIRONMENT_KEYS]));
+  const injected = Object.fromEntries(CERTIFICATE_ENVIRONMENT_KEYS.map(key => [key, `/execution/${key.toLowerCase()}`]));
+  expect(createSanitizedCodexEnvironment(injected)).toMatchObject(injected);
+  const { createSanitizedAcpxSpawnInput } = await import("./drivers/acpx/environment.js");
+  expect({ ...createSanitizedAcpxSpawnInput(injected, "codex").env }).toMatchObject(injected);
+  // Names cross as policy; the injected values never serialize into argv.
+  for (const value of Object.values(injected)) expect(args.join("\n")).not.toContain(value);
 });

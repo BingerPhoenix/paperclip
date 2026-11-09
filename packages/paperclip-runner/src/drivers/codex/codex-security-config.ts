@@ -1,5 +1,5 @@
 import { usesPreconfiguredHome } from "../preconfigured-home.js";
-import { configuredEnvironmentKeys } from "../../configured-environment.js";
+import { CERTIFICATE_ENVIRONMENT_KEYS, configuredEnvironmentKeys } from "../../configured-environment.js";
 import { resolve, isAbsolute, join, dirname, delimiter, relative, sep } from "node:path";
 import { closeSync, constants, existsSync, fstatSync, openSync, realpathSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -267,19 +267,21 @@ export function createIsolatedCodexAppServerArgs(
   readOnlyRoots = [...new Set([...readOnlyRoots, ...codexNetworkReadOnlyRoots(source)])];
   const networkAccess = codexNetworkAccess(source);
   const externalRunnerSandbox = usesExternalRunnerSandbox(source);
-  const inheritedGitHubKeys = [
+  const inheritedEnvironmentKeys = [
+    // Certificate-trust names stay inheritable: sandboxes inject their values
+    // into the execution environment after this policy is constructed.
+    ...CERTIFICATE_ENVIRONMENT_KEYS,
     ...githubCredentialEnvironmentKeys(source),
     ...configuredEnvironmentKeys(explicitSource),
     ...["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"].filter(key => source[key] !== undefined),
   ];
-  const hasProjectedEnvironment = inheritedGitHubKeys.length > 0;
   // Codex filters the configured `set` values through include_only as well.
   // Retain the explicit command PATH/HOME/locale settings, not ambient secrets.
   const commandEnvironment = codexCommandEnvironment(source);
   // Selected task values are inherited, never serialized into configuration argv.
   for (const key of configuredEnvironmentKeys(explicitSource)) delete commandEnvironment[key];
   if (instructionWorkingCopyRoot && source.AGENT_HOME === instructionWorkingCopyRoot) commandEnvironment.AGENT_HOME = instructionWorkingCopyRoot;
-  const shellEnvironmentKeys = [...new Set([...inheritedGitHubKeys, ...Object.keys(commandEnvironment)])].sort();
+  const shellEnvironmentKeys = [...new Set([...inheritedEnvironmentKeys, ...Object.keys(commandEnvironment)])].sort();
   if (source.PAPERCLIP_GITHUB_LAUNCHER_DIR) readOnlyRoots = [...readOnlyRoots, source.PAPERCLIP_GITHUB_LAUNCHER_DIR];
   const deniedHostRoots = usesPreconfiguredHome(source) ? [] : [
     ...new Set(
@@ -357,10 +359,12 @@ export function createIsolatedCodexAppServerArgs(
     `permissions.${CODEX_PLANNING_PERMISSION_PROFILE}.filesystem={${planningFilesystemRules}}`,
     "-c",
     `permissions.${CODEX_PLANNING_PERMISSION_PROFILE}.network.enabled=${networkAccess}`,
+    // Inheritance stays enabled so execution-side injected values (sandbox
+    // certificate trust) reach shells; include_only below is the strict bound.
     "-c",
-    `shell_environment_policy.inherit=${tomlString(hasProjectedEnvironment ? "all" : "none")}`,
+    'shell_environment_policy.inherit="all"',
     "-c",
-    `shell_environment_policy.ignore_default_excludes=${hasProjectedEnvironment}`,
+    "shell_environment_policy.ignore_default_excludes=true",
     // Codex applies include_only after inheritance. Always emit the bounded
     // allowlist: neither host mode nor a broker enables ambient secret access.
     // Keep values in the process environment, never in argv/config diagnostics.
