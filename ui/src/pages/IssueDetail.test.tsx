@@ -1528,6 +1528,7 @@ describe("IssueDetail", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     await act(async () => {
       root.unmount();
     });
@@ -2086,7 +2087,8 @@ describe("IssueDetail", () => {
 
   });
 
-  it.each(["message", "attachment"])("creates an unused conversation only for the first %s and updates its canonical cache", async (kind) => {
+  it.each(["message", "attachment", "plain HTTP message"])("creates an unused conversation only for the first %s and updates its canonical cache", async (kind) => {
+    if (kind === "plain HTTP message") vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
     mockIssuesApi.markRead.mockClear();
     const agent = createAgent();
     const canonical = createIssue({ conversationAgentId: agent.id, conversationUserId: "user-1", conversationState: "waiting", status: "in_review" });
@@ -2104,7 +2106,7 @@ describe("IssueDetail", () => {
       onAdd: (body: string) => Promise<void>;
       onAttachImage: (file: File) => Promise<IssueAttachment>;
     };
-    if (kind === "message") {
+    if (kind !== "attachment") {
       await act(async () => { await props.onAdd("Clarify this goal"); });
       expect(mockIssuesApi.addComment).toHaveBeenCalledWith(canonical.id, "Clarify this goal", undefined, undefined, undefined, expect.any(String));
       expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.issues.comments(canonical.id) });
