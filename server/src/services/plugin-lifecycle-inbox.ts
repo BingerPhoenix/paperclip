@@ -35,7 +35,8 @@ export function pluginLifecycleInbox(db: Db, pluginId: string) {
    * and pending events, not the length of acknowledged history.
    */
   function heads(companyId: string, types: ResourceType[]) {
-    const typeArray = sql`ARRAY[${sql.join(types.map(type => sql`${type}`), sql`, `)}]::text[]`;
+    // A manifest may repeat a type. Duplicate streams would repeat heads and shorten the page.
+    const typeArray = sql`ARRAY[${sql.join([...new Set(types)].map(type => sql`${type}`), sql`, `)}]::text[]`;
     const through = sql`COALESCE(stream_cursor.acknowledged_through_id, 0)`;
     return sql`
       WITH RECURSIVE streams(resource_type, resource_id, last_id) AS (
@@ -118,8 +119,10 @@ export function pluginLifecycleInbox(db: Db, pluginId: string) {
           ORDER BY e.id LIMIT 1)`;
         const creation = sql`(${unacknowledgedCreation(companyId, sql`${event.resourceType}`, sql`${event.resourceId}::uuid`, sql`${through}`)})`;
         // A creation is always deliverable. A transition waits for the creation and every earlier
-        // transition. For a creation, the first row is an earlier pending transition, else the creation.
-        const [blocker] = await tx.execute<{ id: number | string }>(sql`${earlierTransition} UNION ALL ${creation} LIMIT 1`);
+        // transition. The earlier pending transition takes precedence, so for a creation the
+        // blocker is the creation itself only when no earlier transition is pending.
+        const [row] = await tx.execute<{ id: number | string | null }>(sql`SELECT COALESCE(${earlierTransition}, ${creation}) AS id`);
+        const blocker = row?.id == null ? undefined : { id: row.id };
         if (event.action !== "create" && blocker) throw conflict("Acknowledge earlier lifecycle events for this resource first");
         if (credentials) {
           if (event.resourceType !== "project") throw forbidden("Project instance secret event required");

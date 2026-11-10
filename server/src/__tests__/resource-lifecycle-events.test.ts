@@ -623,6 +623,18 @@ describePostgres("Resource lifecycle events", () => {
     expect(await db.select().from(pluginLifecycleResourceCursors).where(eq(pluginLifecycleResourceCursors.pluginId, plugin.id))).toEqual([]);
   });
 
+  it("returns a full page when a manifest repeats a resource type", async () => {
+    const plugin = await createPlugin();
+    const inbox = pluginLifecycleInbox(db, plugin.id);
+    await db.insert(resourceLifecycleEvents).values(Array.from({ length: 101 }, () => ({
+      companyId, resourceType: "agent" as const, resourceId: randomUUID(), action: "create" as const,
+    })));
+    const page = await inbox.list(companyId, 100, undefined, ["agent", "agent"]);
+    expect(page).toHaveLength(100);
+    expect(page).toEqual(await inbox.list(companyId, 100, undefined, ["agent"]));
+    expect(await inbox.list(companyId, 100, page.at(-1)!.id, ["agent", "agent"])).toHaveLength(1);
+  });
+
   it("keeps the cursor behind a pending transition when a late creation is acknowledged first", async () => {
     const plugin = await createPlugin();
     const inbox = pluginLifecycleInbox(db, plugin.id);

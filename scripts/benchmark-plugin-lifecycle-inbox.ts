@@ -128,8 +128,10 @@ try {
   {
     const ackSamples = { baseline: [] as number[], treatment: [] as number[] };
     const [head] = await current.pluginLifecycleInbox(db, plugin.id).list(companyId, 1, undefined, ["agent_runtime"]);
-    const [{ through }] = await client.unsafe(`SELECT acknowledged_through_id::text AS through FROM plugin_lifecycle_resource_cursors
+    // A fresh plugin (--acked=0) has no cursor row; restore that absence between samples.
+    const [cursorRow] = await client.unsafe(`SELECT acknowledged_through_id::text AS through FROM plugin_lifecycle_resource_cursors
       WHERE plugin_id = $1 AND company_id = $2 AND resource_type = 'agent_runtime' AND resource_id = $3`, [plugin.id, companyId, head.resourceId]);
+    const through: string | undefined = cursorRow?.through;
     for (let n = 0; n <= sampleCount; n++) {
       const order = n % 2 === 0 ? (["baseline", "treatment"] as const) : (["treatment", "baseline"] as const);
       for (const which of order.filter(w => !treatmentOnly || w === "treatment")) {
@@ -137,8 +139,13 @@ try {
         await (which === "baseline" ? baseline : current.pluginLifecycleInbox)(db, plugin.id).acknowledge(companyId, head.id);
         if (n > 0) ackSamples[which].push(performance.now() - start);
         await client.unsafe(`DELETE FROM plugin_lifecycle_acknowledgments WHERE plugin_id = $1 AND event_id = $2`, [plugin.id, head.id]);
-        await client.unsafe(`UPDATE plugin_lifecycle_resource_cursors SET acknowledged_through_id = $4
-          WHERE plugin_id = $1 AND company_id = $2 AND resource_type = 'agent_runtime' AND resource_id = $3`, [plugin.id, companyId, head.resourceId, through]);
+        if (through === undefined) {
+          await client.unsafe(`DELETE FROM plugin_lifecycle_resource_cursors
+            WHERE plugin_id = $1 AND company_id = $2 AND resource_type = 'agent_runtime' AND resource_id = $3`, [plugin.id, companyId, head.resourceId]);
+        } else {
+          await client.unsafe(`UPDATE plugin_lifecycle_resource_cursors SET acknowledged_through_id = $4
+            WHERE plugin_id = $1 AND company_id = $2 AND resource_type = 'agent_runtime' AND resource_id = $3`, [plugin.id, companyId, head.resourceId, through]);
+        }
       }
     }
     const stats = (s: number[]) => { const v = [...s].sort((a, b) => a - b); return { median: v[Math.floor(v.length / 2)], min: v[0], max: v.at(-1), samples: s.map(x => Math.round(x * 10) / 10) }; };
