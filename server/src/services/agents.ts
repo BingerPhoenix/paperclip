@@ -1,6 +1,6 @@
 import {
   hasProcessCleanupHold, readProcessCleanupHold, releaseProcessCleanupHoldRequestSchema,
-  validateReviewedProcessCleanup, type ReleaseProcessCleanupHoldRequest,
+  validateReviewedProcessCleanup, processCleanupEvidenceSha256, type ReleaseProcessCleanupHoldRequest,
 } from "./process-cleanup-hold.js";
 import { processSnapshot } from "@paperclipai/adapter-utils/process-containment";
 import { persistActivity, publishActivity } from "./activity-log.js";
@@ -623,6 +623,12 @@ export function agentService(db: Db) {
         try { snapshot = processSnapshot(); }
         catch { throw conflict("Fresh process identity verification is unavailable"); }
         if (!snapshot.length) throw conflict("Fresh process identity verification is unavailable");
+        const officialResult = run.resultJson as Record<string, unknown> | null;
+        const officialCleanup = officialResult?.processCleanup as Record<string, unknown> | undefined;
+        if (existing.adapterConfig.processAccounting !== undefined && (
+          !officialResult?.processAccounting || processCleanupEvidenceSha256(officialResult.processAccounting)
+            !== processCleanupEvidenceSha256(officialCleanup?.accounting)
+        )) throw conflict("Final official accounting must match the reviewed cleanup evidence");
         validateReviewedProcessCleanup({
           cleanup: (run.resultJson as Record<string, unknown> | null)?.processCleanup,
           expectedRunId: input.expectedRunId,

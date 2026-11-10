@@ -52,6 +52,7 @@ export interface ProcessAccountingEvidence {
   limitations: string[];
 }
 export interface ProcessAccountingObserver {
+  rejectAdmission(): void;
   bindRoot(binding: { runId: string; rootPid: number }): void;
   observe(snapshot: { observedAt: string; processes: ProcessIdentity[]; complete?: boolean }): void;
   evidence(): ProcessAccountingEvidence;
@@ -145,6 +146,7 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
       fromExecutable: old.executable ?? null, toExecutable: row.executable ?? null });
   };
   return {
+    rejectAdmission() { errors.add("additional_process_admission_rejected"); },
     bindRoot(binding) {
       if (!binding || !safeText(binding.runId, 128) || !Number.isSafeInteger(binding.rootPid) || binding.rootPid <= 0) {
         errors.add("invalid_root_binding"); return;

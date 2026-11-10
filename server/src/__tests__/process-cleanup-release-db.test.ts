@@ -88,6 +88,16 @@ describeDb("transactional process cleanup release", () => {
     return app;
   }
 
+  it("requires final retained history for accounting-enabled runs before reviewed release", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterConfig: { command: "fixture-before", processAccounting: {} } }).where(eq(agents.id, f.agent.id));
+    const app = await appFor("board", () => true);
+    expect((await request(app).post(`/api/agents/${f.agent.id}/process-cleanup-hold/release`).send(f.input)).status).toBe(409);
+    expect((await f.service.getById(f.agent.id))?.metadata).toHaveProperty("processCleanupHold");
+    await db.update(heartbeatRuns).set({ resultJson: { processCleanup: f.cleanup, processAccounting: f.cleanup.accounting } }).where(eq(heartbeatRuns.id, f.runId));
+    expect((await request(app).post(`/api/agents/${f.agent.id}/process-cleanup-hold/release`).send(f.input)).status).toBe(200);
+  });
+
   it("releases atomically with audit, leaves paused/off, then permits a separate nonsecret paused restoration", async () => {
     const f = await seed(); const app = await appFor("board", () => true);
     const release = await request(app).post(`/api/agents/${f.agent.id}/process-cleanup-hold/release`).send(f.input);

@@ -1,4 +1,4 @@
-import { processAdmissionHolds, agentProcessAdmissionHolds, markProcessAdmissionHold, parseProcessAccountingPolicy } from "../adapters/utils.js";
+import { processAdmissionHolds, agentProcessAdmissionHolds, markProcessAdmissionHold, parseProcessAccountingPolicy, getRetainedProcessEvidence, forgetRetainedProcessEvidence } from "../adapters/utils.js";
 import { hasProcessCleanupHold, processCleanupHoldMetadata } from "./process-cleanup-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -7101,6 +7101,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       metadata: sql`coalesce(${agents.metadata}, '{}'::jsonb) || ${hold}::jsonb`,
       updatedAt: new Date(),
     }).where(eq(agents.id, agent.id));
+  }
+
+  async function holdAccountedExecutionForReview(agent: typeof agents.$inferSelect, runId: string) {
+    if (parseObject(agent.adapterConfig).processAccounting === undefined) return;
+    const current = await getAgent(agent.id);
+    if (current && !hasProcessCleanupHold(current)) {
+      await holdProcessCleanup(current, runId, "accounted_execution_requires_review");
+    }
   }
 
   async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined) {
@@ -16169,6 +16177,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
       let outcome: RunSessionOutcome;
+      await holdAccountedExecutionForReview(agent, run.id);
       const latestRun = await getRun(run.id);
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
@@ -16490,6 +16499,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       );
     } catch (err) {
+      await holdAccountedExecutionForReview(agent, run.id);
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
@@ -16617,6 +16627,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
     } catch (outerErr) {
+          const accountedFailureAgent = await getAgent(run.agentId).catch(() => null);
+          if (accountedFailureAgent) await holdAccountedExecutionForReview(accountedFailureAgent, run.id);
           if (isWorkspaceBusyDeferral(outerErr)) {
             // Expected contention on a shared project workspace, not a
             // failure: park the run as a bounded scheduled retry and leave the
@@ -16812,8 +16824,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               });
             }
           }
+          const retained = getRetainedProcessEvidence(run.id);
+          let accountingPersisted = !retained;
+          if (retained) {
+            try {
+              const accounting = JSON.stringify({ processAccounting: retained.accounting });
+              const cleanup = JSON.stringify(retained.cleanup ? { processCleanup: retained.cleanup } : {});
+              await db.update(heartbeatRuns).set({
+                resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${accounting}::jsonb ||
+                  case when coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'processCleanup'
+                    then '{}'::jsonb else ${cleanup}::jsonb end`,
+                updatedAt: new Date(),
+              }).where(eq(heartbeatRuns.id, run.id));
+              forgetRetainedProcessEvidence(run.id);
+              accountingPersisted = true;
+            } catch (accountingError) {
+              logger.warn({ err: accountingError, runId: run.id }, "accounting evidence retained pending official persistence");
+            }
+          }
           activeRunExecutions.delete(run.id);
-          activeRunAgents.delete(run.id);
+          if (accountingPersisted) activeRunAgents.delete(run.id);
           processAdmissionHolds.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }

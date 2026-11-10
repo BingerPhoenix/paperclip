@@ -4993,7 +4993,7 @@ export function agentRoutes(
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     const live = getLiveProcessAccounting(runId);
-    const stored = readObject(readObject(run.resultJson)?.processCleanup)?.accounting ?? null;
+    const stored = readObject(run.resultJson)?.processAccounting ?? readObject(readObject(run.resultJson)?.processCleanup)?.accounting ?? null;
     res.json({ runId, phase: live ? "live" : stored ? "terminal" : "unavailable", accounting: live ?? stored });
   });
 

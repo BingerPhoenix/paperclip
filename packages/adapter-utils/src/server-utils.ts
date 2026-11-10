@@ -115,8 +115,16 @@ export function signalRunningProcess(
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
+const retainedProcessEvidence = new Map<string, { accounting: ProcessAccountingObserver; cleanup: ProcessCleanupEvidence | null }>();
 export function getLiveProcessAccounting(runId: string) {
-  return runningProcesses.get(runId)?.accounting?.evidence() ?? null;
+  return (runningProcesses.get(runId)?.accounting ?? retainedProcessEvidence.get(runId)?.accounting)?.evidence() ?? null;
+}
+export function getRetainedProcessEvidence(runId: string) {
+  const retained = retainedProcessEvidence.get(runId);
+  return retained ? { accounting: retained.accounting.evidence(), cleanup: retained.cleanup } : null;
+}
+export function forgetRetainedProcessEvidence(runId: string) {
+  retainedProcessEvidence.delete(runId);
 }
 // Ephemeral single-server fence; the agent metadata hold is the restart boundary.
 export type ProcessAccountingPolicy = Omit<ProcessAccountingOptions, "baseline">;
@@ -3373,10 +3381,22 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
-        const accounting = opts.processAccounting ? createProcessAccounting({
-          ...opts.processAccounting,
-          baseline: { observedAt: new Date().toISOString(), processes: processSnapshot() },
-        }) : undefined;
+        let accounting = retainedProcessEvidence.get(runId)?.accounting;
+        if (accounting) {
+          accounting.rejectAdmission();
+          processAdmissionHolds.add(runId);
+          if (opts.env.PAPERCLIP_AGENT_ID) agentProcessAdmissionHolds.add(opts.env.PAPERCLIP_AGENT_ID);
+          void target.cleanup?.();
+          throw new Error("An accounted official run cannot admit another process");
+        }
+        if (opts.processAccounting && !accounting) {
+          if (retainedProcessEvidence.size >= 128) throw new Error("Process accounting retention capacity exceeded");
+          accounting = createProcessAccounting({
+            ...opts.processAccounting,
+            baseline: { observedAt: new Date().toISOString(), processes: processSnapshot() },
+          });
+          retainedProcessEvidence.set(runId, { accounting, cleanup: null });
+        }
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
@@ -3543,7 +3563,10 @@ export async function runChildProcess(
           settled = true;
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          if (!processCleanup && accounting) processCleanup = containment.stop(Math.max(1, opts.graceSec) * 1000);
           const cleanup = processCleanup ? await processCleanup : null;
+          const retained = retainedProcessEvidence.get(runId);
+          if (retained) retained.cleanup = cleanup;
           containment.dispose();
           runningProcesses.delete(runId);
           if (forced) {
