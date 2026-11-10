@@ -3,8 +3,46 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { runChildProcess, processAdmissionHolds } from "./server-utils.js";
 import { processSnapshot, trackOwnedProcesses } from "./process-containment.js";
+import { createProcessAccounting } from "./process-accounting.js";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 describe("bounded owned process cleanup", () => {
+  it("reads executable metadata without exporting this owned fixture's argument canary", async () => {
+    const child = spawn(process.execPath, ["-e", "setTimeout(()=>{},1000)", "ARGUMENT-CANARY-DO-NOT-EXPORT"], {
+      stdio: "ignore",
+    });
+    try {
+      const row = processSnapshot().find((r) => r.pid === child.pid);
+      expect(row?.executable).toBeTruthy();
+      expect(JSON.stringify(row)).not.toContain("ARGUMENT-CANARY-DO-NOT-EXPORT");
+      expect(Object.keys(row!)).toEqual(["pid", "parent", "start", "state", "executable"]);
+    } finally {
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      child.kill("SIGTERM"); await exited;
+    }
+  }, 2000);
+  it("retains classified capture and bound accounting in official cleanup evidence", async () => {
+    const at = new Date().toISOString();
+    const accounting = createProcessAccounting({
+      baseline: { observedAt: at, processes: [] }, sourceCommit: "a".repeat(40), contractSha256: "b".repeat(64),
+      expectedNativeStarts: 0, rootLauncherPinId: "node",
+      pins: [{ id: "node", path: process.execPath, classification: "node_helper",
+        sha256: createHash("sha256").update(readFileSync(process.execPath)).digest("hex") }],
+    });
+    accounting.bindRoot({ runId: "owned-fixture-run", rootPid: 101 });
+    let rows = [{ pid: 101, parent: 1, start: "root", state: "S", executable: process.execPath },
+      { pid: 102, parent: 101, start: "child", state: "S", executable: process.execPath }];
+    const tracker = trackOwnedProcesses({ pid: 101, exitCode: null, signalCode: null } as ChildProcess, {
+      snapshot: () => rows,
+      signal: (pid) => { rows = rows.filter((row) => row.pid !== pid); return true; },
+    }, accounting);
+    const result = await tracker.stop(0);
+    expect(result.state).toBe("observed_gone");
+    expect(result.accounting?.state).toBe("bounded_observed");
+    expect(result.capturedIdentities.map((row) => row.classification)).toEqual(["known_launcher", "node_helper"]);
+    expect(result.capturedIdentities.map((row) => row.pid)).toEqual([101, 102]);
+  });
   it("cleans a captured detached child after reparenting, within a five second fixture lifetime", async () => {
     const root = spawn(process.execPath, ["-e", `const{spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:'ignore'});console.log(c.pid);setTimeout(()=>{},5000);`], { stdio: ["ignore", "pipe", "ignore"], detached: true });
     const tracker = trackOwnedProcesses(root);
