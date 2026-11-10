@@ -98,6 +98,25 @@ describeDb("transactional process cleanup release", () => {
     expect((await request(app).post(`/api/agents/${f.agent.id}/process-cleanup-hold/release`).send(f.input)).status).toBe(200);
   });
 
+  it("cannot bypass unknown final accounting by removing the current policy", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterConfig: { command: "fixture-before" } }).where(eq(agents.id, f.agent.id));
+    await db.update(heartbeatRuns).set({ resultJson: { processCleanup: f.cleanup,
+      processAccounting: { ...f.cleanup.accounting, state: "unknown", errors: ["additional_process_admission_rejected"] } } }).where(eq(heartbeatRuns.id, f.runId));
+    const app = await appFor("board", () => true);
+    expect((await request(app).post(`/api/agents/${f.agent.id}/process-cleanup-hold/release`).send(f.input)).status).toBe(409);
+    expect((await f.service.getById(f.agent.id))?.metadata).toHaveProperty("processCleanupHold");
+  });
+
+  it("keeps a durable required-accounting hold when final persistence is missing", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterConfig: { command: "fixture-before" },
+      metadata: { processCleanupHold: { ...f.agent.metadata!.processCleanupHold as object, accountingRequired: true } } }).where(eq(agents.id, f.agent.id));
+    const app = await appFor("board", () => true);
+    expect((await request(app).post(`/api/agents/${f.agent.id}/process-cleanup-hold/release`).send(f.input)).status).toBe(409);
+    expect((await f.service.getById(f.agent.id))?.metadata).toHaveProperty("processCleanupHold");
+  });
+
   it("releases atomically with audit, leaves paused/off, then permits a separate nonsecret paused restoration", async () => {
     const f = await seed(); const app = await appFor("board", () => true);
     const release = await request(app).post(`/api/agents/${f.agent.id}/process-cleanup-hold/release`).send(f.input);

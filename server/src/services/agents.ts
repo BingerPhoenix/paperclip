@@ -625,7 +625,8 @@ export function agentService(db: Db) {
         if (!snapshot.length) throw conflict("Fresh process identity verification is unavailable");
         const officialResult = run.resultJson as Record<string, unknown> | null;
         const officialCleanup = officialResult?.processCleanup as Record<string, unknown> | undefined;
-        if (existing.adapterConfig.processAccounting !== undefined && (
+        if ((hold.accountingRequired === true || existing.adapterConfig.processAccounting !== undefined
+          || officialResult?.processAccounting !== undefined) && (
           !officialResult?.processAccounting || processCleanupEvidenceSha256(officialResult.processAccounting)
             !== processCleanupEvidenceSha256(officialCleanup?.accounting)
         )) throw conflict("Final official accounting must match the reviewed cleanup evidence");

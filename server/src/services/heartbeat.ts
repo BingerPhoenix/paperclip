@@ -7093,7 +7093,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function holdProcessCleanup(agent: typeof agents.$inferSelect, runId: string, reason: string) {
-    const metadata = processCleanupHoldMetadata(null, runId, reason);
+    const metadata = processCleanupHoldMetadata(null, runId, reason,
+      parseObject(agent.adapterConfig).processAccounting !== undefined || !!getRetainedProcessEvidence(runId));
     markProcessAdmissionHold(agent.id, runId, metadata.processCleanupHold.holdId);
     const hold = JSON.stringify(metadata);
     await db.update(agents).set({

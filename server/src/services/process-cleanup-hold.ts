@@ -8,12 +8,12 @@ export function hasProcessCleanupHold(agent: { metadata?: unknown } | null | und
   return !!metadata && typeof metadata === "object" && "processCleanupHold" in metadata;
 }
 
-export function processCleanupHoldMetadata(metadata: unknown, runId: string, reason: string) {
+export function processCleanupHoldMetadata(metadata: unknown, runId: string, reason: string, accountingRequired = false) {
   return {
     ...(metadata && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : {}),
     processCleanupHold: {
       holdId: randomUUID(), runId, reason, state: "review_required",
-      scope: "sampled_pid_start_identity", createdAt: new Date().toISOString(),
+      scope: "sampled_pid_start_identity", createdAt: new Date().toISOString(), accountingRequired,
     },
   };
 }
