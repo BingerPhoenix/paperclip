@@ -75,7 +75,7 @@ try {
     WHERE resource_type = 'agent' OR (resource_type = 'project' AND rank = 1) OR (resource_type = 'agent_runtime' AND rank <= $3)`,
     [plugin.id, companyId, acked]);
   // Upgrade path: carry the acknowledgment rows into resource cursors as the migration does.
-  const cursorMigration = await fs.readFile(new URL("../packages/db/src/migrations/0457_plugin_lifecycle_resource_cursors.sql", import.meta.url), "utf8");
+  const cursorMigration = await fs.readFile(new URL("../packages/db/src/migrations/0461_plugin_lifecycle_resource_cursors.sql", import.meta.url), "utf8");
   const backfill = cursorMigration.split("--> statement-breakpoint").find(statement => statement.includes('INSERT INTO "plugin_lifecycle_resource_cursors"'));
   assert.ok(backfill, "cursor backfill statement not found");
   const backfillStart = performance.now();
