@@ -172,7 +172,13 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
         try { if (fingerprint(pin.path) !== pin.fingerprint || realpathSync(pin.originalPath) !== pin.path) errors.add("executable_pin_changed"); }
         catch { errors.add("executable_pin_unavailable"); }
       }
-      const rows = snapshot.processes;
+      const rows = snapshot.processes.map((row) => {
+        const previous = latest.get(key(row)) ?? lastObservation.get(key(row));
+        // A known identity's terminal ps row can lose comm. Preserve its last
+        // observed executable as history, never as a new live classification.
+        return row.state.startsWith("Z") && row.executable == null && previous?.executable
+          ? { ...row, executable: previous.executable } : row;
+      });
       const byPid = new Map(rows.map((row) => [row.pid, row]));
       if (!root && rootPid !== null) {
         const row = byPid.get(rootPid);
@@ -194,7 +200,9 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
       for (const row of rows) {
         const rowKey = key(row);
         const current = classify(row);
-        const old = latest.get(rowKey);
+        const retainedSame = lastObservation.get(rowKey);
+        const old = latest.get(rowKey) ?? (row.state.startsWith("Z") && retainedSame
+          ? { ...retainedSame, state: "previously_observed" } : undefined);
         const retainedPrevious = observations.findLast((item) => item.pid === row.pid);
         const oldPid = latestPid.get(row.pid) ?? (retainedPrevious ? {
           ...retainedPrevious, state: "previously_observed" } : undefined);

@@ -62,6 +62,30 @@ describe("prospective bounded process accounting", () => {
     expect(result.modelStartCount).toBe(1); expect(result.observations.find((r) => r.pid === 101)?.owned).toBe(true);
     expect(result.transitions.map((t) => t.kind)).toContain("reparent"); expect(result.state).toBe("bounded_observed");
   });
+  it("retains a known zombie executable as history without inventing an exec change or native restart", () => {
+    const accounting = createProcessAccounting(options); bind(accounting);
+    accounting.observe({ observedAt: at(50), processes: [row(100, 1, node), row(101, 100, native)] });
+    const zombie = { ...row(101, 1, null), state: "Z+" };
+    accounting.observe({ observedAt: at(100), processes: [row(100, 1, node), zombie] });
+    accounting.observe({ observedAt: at(150), processes: [row(100, 1, node)] });
+    accounting.observe({ observedAt: at(200), processes: [row(100, 1, node), zombie] });
+    const result = accounting.evidence();
+    expect(result.state).toBe("bounded_observed"); expect(result.modelStartCount).toBe(1);
+    expect(result.observations.findLast((item) => item.pid === 101)?.executable).toBe(native);
+    expect(result.observations.findLast((item) => item.pid === 101)?.classification).toBe("native_model");
+    expect(result.transitions.map((item) => item.kind)).toEqual(["reparent"]);
+  });
+  it("keeps unseen zombies, reused zombie PIDs and unknown live identities unknown", () => {
+    for (const kind of ["unseen", "reused", "live"]) {
+      const accounting = createProcessAccounting({ ...options, expectedNativeStarts: 0 }); bind(accounting);
+      accounting.observe({ observedAt: at(50), processes: [row(100, 1, node), row(101, 100, node)] });
+      const unknown = { ...row(kind === "unseen" ? 102 : 101, 100, null, kind === "reused" ? "replacement" : kind === "unseen" ? "start-102" : "start-101"), state: kind === "live" ? "S" : "Z" };
+      accounting.observe({ observedAt: at(100), processes: [row(100, 1, node), unknown] });
+      expect(accounting.evidence().state).toBe("unknown");
+      expect(accounting.evidence().errors).toContain("unknown_owned_executable");
+      expect(accounting.evidence().observations.findLast((item) => item.pid === unknown.pid)?.executable).toBeNull();
+    }
+  });
   it("counts PID reuse and helper-to-native executable transitions as new native starts", () => {
     const accounting = createProcessAccounting(options); bind(accounting);
     accounting.observe({ observedAt: at(50), processes: [row(100, 1, node), row(101, 100, native, "old")] });

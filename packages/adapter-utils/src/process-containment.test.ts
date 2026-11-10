@@ -43,6 +43,27 @@ describe("bounded owned process cleanup", () => {
     expect(result.capturedIdentities.map((row) => row.classification)).toEqual(["known_launcher", "node_helper"]);
     expect(result.capturedIdentities.map((row) => row.pid)).toEqual([101, 102]);
   });
+  it("retains known zombie executable history in cleanup without signalling dead identities", async () => {
+    const accounting = createProcessAccounting({
+      baseline: { observedAt: new Date().toISOString(), processes: [] }, sourceCommit: "a".repeat(40),
+      contractSha256: "b".repeat(64), expectedNativeStarts: 0, rootLauncherPinId: "node",
+      pins: [{ id: "node", path: process.execPath, classification: "node_helper",
+        sha256: createHash("sha256").update(readFileSync(process.execPath)).digest("hex") }],
+    });
+    accounting.bindRoot({ runId: "zombie-fixture", rootPid: 101 });
+    let rows: import("./process-containment.js").ProcessIdentity[] = [
+      { pid: 101, parent: 1, start: "root", state: "S", executable: process.execPath },
+      { pid: 102, parent: 101, start: "child", state: "S", executable: process.execPath }];
+    const signal = vi.fn();
+    const tracker = trackOwnedProcesses({ pid: 101, exitCode: null, signalCode: null } as ChildProcess,
+      { snapshot: () => rows, signal }, accounting);
+    rows = rows.map(row => ({ ...row, state: "Z", executable: null }));
+    const result = await tracker.stop(0);
+    expect(signal).not.toHaveBeenCalled(); expect(result.state).toBe("observed_gone");
+    expect(result.accounting?.state).toBe("bounded_observed");
+    expect(result.capturedIdentities.map(row => row.executable)).toEqual([process.execPath, process.execPath]);
+    expect(result.capturedIdentities.map(row => row.classification)).toEqual(["known_launcher", "node_helper"]);
+  });
   it("cleans a captured detached child after reparenting, within a five second fixture lifetime", async () => {
     const root = spawn(process.execPath, ["-e", `const{spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:'ignore'});console.log(c.pid);setTimeout(()=>{},5000);`], { stdio: ["ignore", "pipe", "ignore"], detached: true });
     const tracker = trackOwnedProcesses(root);

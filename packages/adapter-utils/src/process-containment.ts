@@ -38,11 +38,18 @@ export function trackOwnedProcesses(child: ChildProcess, deps = {
   const errors = new Set<string>();
   let rootStart: string | null = null;
   let stopping: Promise<ProcessCleanupEvidence> | null = null;
+  const remember = (row: ProcessIdentity) => {
+    const previous = known.get(identityKey(row));
+    // Retain historical executable metadata when this exact dead identity's
+    // terminal ps row loses comm; never borrow metadata across PID reuse.
+    known.set(identityKey(row), row.state.startsWith("Z") && row.executable == null && previous?.executable
+      ? { ...row, executable: previous.executable } : row);
+  };
   const sample = () => {
     const rows = deps.snapshot();
     const root = rows.find((r) => r.pid === child.pid);
     if (!rootStart && root && child.exitCode === null && child.signalCode === null) rootStart = root.start;
-    if (root && root.start === rootStart) known.set(identityKey(root), root);
+    if (root && root.start === rootStart) remember(root);
     let changed = true;
     while (changed) {
       changed = false;
@@ -55,7 +62,7 @@ export function trackOwnedProcesses(child: ChildProcess, deps = {
         }
       }
     }
-    for (const row of rows) if (known.has(identityKey(row))) known.set(identityKey(row), row);
+    for (const row of rows) if (known.has(identityKey(row))) remember(row);
     accounting?.observe({ observedAt: new Date().toISOString(), processes: rows });
     return rows;
   };
