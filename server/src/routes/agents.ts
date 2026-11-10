@@ -1,3 +1,4 @@
+import { hasProcessCleanupHold } from "../services/process-cleanup-hold.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -3955,6 +3956,10 @@ export function agentRoutes(
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before resuming it",
       });
+      return;
+    }
+    if (hasProcessCleanupHold(existing)) {
+      res.status(409).json({ error: "Process cleanup requires explicit operator review before resume" });
       return;
     }
     const agent = await svc.resume(id);

@@ -1,3 +1,4 @@
+import { hasProcessCleanupHold } from "./process-cleanup-hold.js";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -576,6 +577,10 @@ export function agentService(db: Db) {
     const existing = await getById(id);
     if (!existing) return null;
 
+    if (hasProcessCleanupHold(existing) && (
+      (data.status !== undefined && data.status !== "paused" && data.status !== "terminated") ||
+      (Object.prototype.hasOwnProperty.call(data, "metadata") && JSON.stringify((data.metadata as Record<string, unknown> | null)?.processCleanupHold) !== JSON.stringify((existing.metadata as Record<string, unknown>).processCleanupHold))
+    )) throw conflict("Process cleanup requires explicit operator review; the hold cannot be cleared through ordinary agent updates");
     if (existing.status === "terminated" && data.status && data.status !== "terminated") {
       throw conflict("Terminated agents cannot be resumed");
     }
@@ -652,10 +657,10 @@ export function agentService(db: Db) {
       const updated = await txDb
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), sql`not (coalesce(${agents.metadata}, '{}'::jsonb) ? 'processCleanupHold')`))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (!updated) return null;
+      if (!updated) throw conflict("Agent update blocked by concurrent process cleanup hold; refresh and review");
 
       if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
         if (bindingDecision) {
@@ -805,6 +810,7 @@ export function agentService(db: Db) {
     resume: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (hasProcessCleanupHold(existing)) throw conflict("Process cleanup requires explicit operator review before resume");
       if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot be resumed");
@@ -819,15 +825,17 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), sql`not (coalesce(${agents.metadata}, '{}'::jsonb) ? 'processCleanupHold')`))
         .returning()
         .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+      if (!updated) throw conflict("Agent mutation blocked by concurrent process cleanup hold; refresh and review");
+      return getById(updated.id);
     },
 
     clearError: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (hasProcessCleanupHold(existing)) throw conflict("Process cleanup requires explicit operator review before clearing errors");
       if (existing.status === "terminated") throw conflict("Cannot clear error on terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot have errors cleared");
@@ -845,7 +853,7 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(and(eq(agents.id, id), eq(agents.status, "error")))
+        .where(and(eq(agents.id, id), eq(agents.status, "error"), sql`not (coalesce(${agents.metadata}, '{}'::jsonb) ? 'processCleanupHold')`))
         .returning()
         .then((rows) => rows[0] ?? null);
 

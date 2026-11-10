@@ -1342,7 +1342,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const toResult = (
       attempt: {
-        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string };
+        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; processCleanup?: import("@paperclipai/adapter-utils/process-containment").ProcessCleanupEvidence | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
         monitor?:
@@ -1391,6 +1391,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          resultJson: { processCleanup: attempt.proc.processCleanup ?? { state: "unknown", scope: "sampled_pid_start_identity" } },
           clearSession: clearSessionOnMissingSession,
         };
       }

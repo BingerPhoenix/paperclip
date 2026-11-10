@@ -1,0 +1,61 @@
+import { describe, it, expect } from "vitest";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { runChildProcess, processAdmissionHolds } from "./server-utils.js";
+import { processSnapshot, trackOwnedProcesses } from "./process-containment.js";
+
+describe("bounded owned process cleanup", () => {
+  it("cleans a captured detached child after reparenting, within a five second fixture lifetime", async () => {
+    const root = spawn(process.execPath, ["-e", `const{spawn}=require('node:child_process');const c=spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:'ignore'});console.log(c.pid);setTimeout(()=>{},5000);`], { stdio: ["ignore", "pipe", "ignore"], detached: true });
+    const tracker = trackOwnedProcesses(root);
+    const childPid = await new Promise<number>((resolve) => root.stdout!.once("data", (data) => resolve(Number(String(data).trim()))));
+    await new Promise((r) => setTimeout(r, 120));
+    root.kill("SIGTERM");
+    const result = await tracker.stop(200);
+    expect(result.state).toBe("observed_gone");
+    expect(result.observed).toBeGreaterThanOrEqual(2);
+    expect(processSnapshot().some((p) => p.pid === childPid && !p.state.startsWith("Z"))).toBe(false);
+  }, 6000);
+  it("awaits bounded timeout cleanup and records its observed scope", async () => {
+    const result=await runChildProcess("finite-timeout-fixture",process.execPath,["-e","setTimeout(()=>{},5000)"],{
+      cwd:process.cwd(),env:{},timeoutSec:0.2,graceSec:1,onLog:async()=>{},
+    });
+    expect(result.timedOut).toBe(true); expect(result.processCleanup?.state).toBe("observed_gone");
+    expect(result.processCleanup?.scope).toBe("sampled_pid_start_identity");
+  },6000);
+  it("fences a cancellation while asynchronous spawn preparation is pending", async () => {
+    const id="finite-cancel-before-spawn"; let spawned=false;
+    const pending=runChildProcess(id,process.execPath,["-e","process.exit(99)"],{
+      cwd:process.cwd(),env:{},timeoutSec:1,graceSec:1,onLog:async()=>{},
+      onSpawn:async()=>{spawned=true;},
+    });
+    // runChildProcess has begun async resolveSpawnTarget, but its spawn microtask
+    // has not run. This is the same shared latch used by API cancellation.
+    processAdmissionHolds.add(id);
+    try { await expect(pending).rejects.toThrow("cancellation prevents"); expect(spawned).toBe(false); }
+    finally { processAdmissionHolds.delete(id); }
+  });
+  it("preserves signal denial as unknown even when the root disappears", async () => {
+    let rows = [{pid: 101,parent: 1,start: "same",state: "S"}];
+    const tracker = trackOwnedProcesses({pid:101,exitCode:null,signalCode:null} as ChildProcess, {
+      snapshot: () => rows,
+      signal: () => { rows=[]; throw Object.assign(new Error("denied"), {code:"EPERM"}); },
+    });
+    const result = await tracker.stop(0);
+    expect(result.state).toBe("unknown"); expect(result.errors).toContain("signal_denied_or_unknown");
+  });
+  it("does not signal a reused PID", async () => {
+    let start="original"; const signals:number[]=[];
+    const tracker=trackOwnedProcesses({pid:101,exitCode:null,signalCode:null} as ChildProcess, {
+      snapshot:()=>[{pid:101,parent:1,start,state:"S"}], signal:(pid)=>{signals.push(pid);},
+    });
+    start="replacement"; const result=await tracker.stop(0);
+    expect(signals).toEqual([]); expect(result.state).toBe("observed_gone");
+  });
+  it("fails closed if metadata cannot be read", async () => {
+    const tracker=trackOwnedProcesses({pid:101,exitCode:null,signalCode:null} as ChildProcess, {
+      snapshot:()=>{throw new Error("unavailable");}, signal:()=>{throw new Error("must not signal");},
+    });
+    expect((await tracker.stop(0)).state).toBe("unknown");
+  });
+});

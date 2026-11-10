@@ -1,3 +1,4 @@
+import { trackOwnedProcesses, type ProcessCleanupEvidence } from "./process-containment.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
@@ -30,6 +31,7 @@ export interface RunProcessResult {
   finishedAt?: string | null;
   durationMs?: number | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+  processCleanup?: ProcessCleanupEvidence | null;
 }
 
 export interface TerminalResultCleanupOptions {
@@ -51,7 +53,8 @@ export interface TerminalResultCleanupEvidence {
   forceKilled: boolean;
 }
 
-interface RunningProcess {
+export interface RunningProcess {
+  containment?: ReturnType<typeof trackOwnedProcesses>;
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
@@ -106,6 +109,8 @@ export function signalRunningProcess(
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
+// Ephemeral single-server fence; the agent metadata hold is the restart boundary.
+export const processAdmissionHolds = new Set<string>();
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
@@ -3335,6 +3340,10 @@ export async function runChildProcess(
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
+        if (processAdmissionHolds.has(runId)) {
+          void target.cleanup?.();
+          throw new Error("Run cancellation prevents child process admission");
+        }
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -3356,7 +3365,9 @@ export async function runChildProcess(
             })
             : Promise.resolve();
 
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
+        const containment = trackOwnedProcesses(child);
+        let processCleanup: Promise<ProcessCleanupEvidence> | null = null;
+        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId, containment });
 
         let timedOut = false;
         let stdout = "";
@@ -3421,10 +3432,7 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
-                signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(() => {
-                  signalRunningProcess({ child, processGroupId }, "SIGKILL");
-                }, Math.max(1, opts.graceSec) * 1000);
+                processCleanup = containment.stop(Math.max(1, opts.graceSec) * 1000);
               }, opts.timeoutSec * 1000)
             : null;
 
@@ -3473,6 +3481,7 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
+          containment.dispose();
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -3493,8 +3502,9 @@ export async function runChildProcess(
           runningProcesses.delete(runId);
           void logChain.finally(() => {
             void Promise.resolve()
-              .then(() => target.cleanup?.())
-              .finally(() => {
+              .then(() => processCleanup)
+              .then(() => { containment.dispose(); return target.cleanup?.(); })
+              .finally(async () => {
               resolve({
                 exitCode: code,
                 signal,
@@ -3503,6 +3513,7 @@ export async function runChildProcess(
                 stderr,
                 pid: child.pid ?? null,
                 startedAt,
+                processCleanup: processCleanup ? await processCleanup : null,
                 terminalResultCleanup: terminalCleanupStarted
                   ? {
                     kind: "terminal_result_cleanup",
