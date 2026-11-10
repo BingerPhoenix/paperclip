@@ -1707,7 +1707,7 @@ resource streams and pending events, not with the journal size. Acknowledgment
 reads only the events between the cursor and the acknowledged event. The
 idle-sleep check asks whether any stream has a head.
 
-Migration `0461` creates the cursor table and carries existing acknowledgments
+Migration `0462` creates the cursor table and carries existing acknowledgments
 forward. For each plugin and resource it stores the end of the contiguous
 acknowledged prefix of events. A cursor never passes an unacknowledged event, so
 a gap is still delivered. Acknowledged events after the gap are still skipped

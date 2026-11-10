@@ -573,7 +573,7 @@ describePostgres("Resource lifecycle events", () => {
     const otherBefore = await pluginLifecycleInbox(db, other.id).list(companyId, 100, undefined, [...all]);
     expect(before.map(e => Number(e.id))).toEqual([agentTransitions[3].id, gap[0].id]);
 
-    const migration = readFileSync(new URL("../../../packages/db/src/migrations/0461_plugin_lifecycle_resource_cursors.sql", import.meta.url), "utf8");
+    const migration = readFileSync(new URL("../../../packages/db/src/migrations/0462_plugin_lifecycle_resource_cursors.sql", import.meta.url), "utf8");
     const backfill = migration.split("--> statement-breakpoint").filter(statement => statement.includes('INSERT INTO "plugin_lifecycle_resource_cursors"'));
     expect(backfill).toHaveLength(1);
     await db.execute(sql.raw(backfill[0]));
