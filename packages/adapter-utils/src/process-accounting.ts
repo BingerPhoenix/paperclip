@@ -26,6 +26,7 @@ export interface ClassifiedProcessIdentity {
   classification: ExecutableClassification;
 }
 export interface ProcessObservation extends ClassifiedProcessIdentity {
+  state: string;
   firstObservedAt: string; lastObservedAt: string; pinId: string | null;
   artifactSha256: string | null; owned: boolean; runId: string | null;
 }
@@ -225,10 +226,11 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
           const previous = lastObservation.get(rowKey);
           if (previous && previous.executable === current.executable && previous.classification === current.classification) {
             previous.lastObservedAt = snapshot.observedAt;
+            previous.state = row.state;
             previous.parent = row.parent;
             previous.owned ||= isOwned;
           } else if (observations.length < bounds.maxObservations) {
-            const observation = { ...current, firstObservedAt: snapshot.observedAt, lastObservedAt: snapshot.observedAt,
+            const observation = { ...current, state: row.state, firstObservedAt: snapshot.observedAt, lastObservedAt: snapshot.observedAt,
               owned: isOwned, runId };
             observations.push(observation); lastObservation.set(rowKey, observation);
           } else errors.add("observation_limit");

@@ -1,5 +1,6 @@
 import { execFileSync, type ChildProcess } from "node:child_process";
 import { isAbsolute } from "node:path";
+import { pinnedProcessSnapshot } from "./process-snapshot-helper.js";
 import type { ClassifiedProcessIdentity, ProcessAccountingEvidence, ProcessAccountingObserver } from "./process-accounting.js";
 
 export interface ProcessIdentity { pid: number; parent: number; start: string; state: string; executable?: string | null }
@@ -15,6 +16,13 @@ export interface ProcessCleanupEvidence {
 // Only process metadata is read: command arguments and environments can contain secrets.
 export function processSnapshot(): ProcessIdentity[] {
   if (process.platform === "win32") throw new Error("unsupported_platform");
+  const helper = process.env.PAPERCLIP_PROCESS_SNAPSHOT_HELPER;
+  const helperSha = process.env.PAPERCLIP_PROCESS_SNAPSHOT_HELPER_SHA256;
+  if (helper !== undefined || helperSha !== undefined) {
+    if (process.platform !== "darwin" || !helper || !helperSha) throw new Error("invalid_snapshot_helper_configuration");
+    // Explicit isolated-instance opt-in. A broken pin never falls back to ps.
+    return pinnedProcessSnapshot(helper, helperSha);
+  }
   const output = execFileSync("ps", ["-axo", "pid=,ppid=,lstart=,stat=,comm="], {
     encoding: "utf8", timeout: 1000, maxBuffer: 8 * 1024 * 1024,
     stdio: ["ignore", "pipe", "ignore"],
