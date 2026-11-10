@@ -1296,6 +1296,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           graceSec,
           onSpawn: wrappedOnSpawn,
           onTimeout: ctx.onTimeout,
+          processAccounting: ctx.processAccounting,
           onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: async (stream, chunk) => {
             monitor?.noteOutputChunk(stream, chunk);

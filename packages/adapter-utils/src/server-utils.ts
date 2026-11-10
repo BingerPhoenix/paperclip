@@ -1,4 +1,8 @@
 import { trackOwnedProcesses, type ProcessCleanupEvidence } from "./process-containment.js";
+import { createProcessAccounting, type ProcessAccountingOptions, type ProcessAccountingObserver } from "./process-accounting.js";
+import { processSnapshot } from "./process-containment.js";
+import { processAdmissionHolds, agentProcessAdmissionHolds } from "./process-admission-hold.js";
+export { processAdmissionHolds, agentProcessAdmissionHolds, markProcessAdmissionHold, clearProcessAdmissionHold } from "./process-admission-hold.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
@@ -55,6 +59,7 @@ export interface TerminalResultCleanupEvidence {
 
 export interface RunningProcess {
   containment?: ReturnType<typeof trackOwnedProcesses>;
+  accounting?: ProcessAccountingObserver;
   finishStopped?: (evidence: ProcessCleanupEvidence) => void;
   child: ChildProcess;
   graceSec: number;
@@ -110,9 +115,25 @@ export function signalRunningProcess(
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
+export function getLiveProcessAccounting(runId: string) {
+  return runningProcesses.get(runId)?.accounting?.evidence() ?? null;
+}
 // Ephemeral single-server fence; the agent metadata hold is the restart boundary.
-export const processAdmissionHolds = new Set<string>();
-export const agentProcessAdmissionHolds = new Set<string>();
+export type ProcessAccountingPolicy = Omit<ProcessAccountingOptions, "baseline">;
+export function parseProcessAccountingPolicy(value: unknown): ProcessAccountingPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid process accounting policy");
+  const policy = value as Record<string, unknown>;
+  const allowed = new Set(["sourceCommit", "contractSha256", "pins", "expectedNativeStarts", "rootLauncherPinId", "bounds"]);
+  if (Object.keys(policy).some((key) => !allowed.has(key))
+    || typeof policy.sourceCommit !== "string" || !/^[a-f0-9]{40}$/.test(policy.sourceCommit)
+    || typeof policy.contractSha256 !== "string" || !/^[a-f0-9]{64}$/.test(policy.contractSha256)
+    || ![0, 1].includes(policy.expectedNativeStarts as number)
+    || !Array.isArray(policy.pins) || !policy.pins.length || policy.pins.length > 64) {
+    throw new Error("Invalid process accounting policy");
+  }
+  return value as ProcessAccountingPolicy;
+}
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
@@ -3304,6 +3325,7 @@ export async function runChildProcess(
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onTimeout?: () => Promise<void>;
+    processAccounting?: ProcessAccountingPolicy;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
@@ -3351,6 +3373,10 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        const accounting = opts.processAccounting ? createProcessAccounting({
+          ...opts.processAccounting,
+          baseline: { observedAt: new Date().toISOString(), processes: processSnapshot() },
+        }) : undefined;
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
@@ -3368,9 +3394,10 @@ export async function runChildProcess(
             })
             : Promise.resolve();
 
-        const containment = trackOwnedProcesses(child);
+        accounting?.bindRoot({ runId, rootPid: child.pid ?? 0 });
+        const containment = trackOwnedProcesses(child, undefined, accounting);
         let processCleanup: Promise<ProcessCleanupEvidence> | null = null;
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId, containment,
+        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId, containment, accounting,
           finishStopped: (evidence) => { processCleanup = Promise.resolve(evidence); void settle(null, null, true); },
         });
 

@@ -1,4 +1,4 @@
-import { processAdmissionHolds, agentProcessAdmissionHolds } from "../adapters/utils.js";
+import { processAdmissionHolds, agentProcessAdmissionHolds, markProcessAdmissionHold, parseProcessAccountingPolicy } from "../adapters/utils.js";
 import { hasProcessCleanupHold, processCleanupHoldMetadata } from "./process-cleanup-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -778,6 +778,7 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+const activeRunAgents = new Map<string, string>();
 // Background heartbeat executions are dispatched fire-and-forget (see
 // startNextQueuedRunForAgent), so the promise that resolves once a run's DB
 // writes are fully flushed is otherwise unobservable. Track those promises here
@@ -795,6 +796,12 @@ const activeRunExecutionPromises = new Set<Promise<void>>();
 // can await a wake that is still before run registration. A caller that tears
 // down a shared database (a test afterEach) then cannot race a late wake.
 const activeWakeupPromises = new Set<Promise<unknown>>();
+const activeWakeupAgents = new Map<Promise<unknown>, string>();
+
+/** Includes asynchronous public wake prologues and terminal runs still flushing. */
+export function isProcessCleanupRuntimeIdle(agentId: string): boolean {
+  return ![...activeRunAgents.values(), ...activeWakeupAgents.values()].includes(agentId);
+}
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
@@ -7086,7 +7093,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function holdProcessCleanup(agent: typeof agents.$inferSelect, runId: string, reason: string) {
-    const hold = JSON.stringify(processCleanupHoldMetadata(null, runId, reason));
+    const metadata = processCleanupHoldMetadata(null, runId, reason);
+    markProcessAdmissionHold(agent.id, runId, metadata.processCleanupHold.holdId);
+    const hold = JSON.stringify(metadata);
     await db.update(agents).set({
       status: sql`case when ${agents.status} = 'terminated' then 'terminated' else 'paused' end`,
       metadata: sql`coalesce(${agents.metadata}, '{}'::jsonb) || ${hold}::jsonb`,
@@ -13962,8 +13971,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ): ReturnType<typeof enqueueWakeup> {
     const promise = enqueueWakeup(agentId, opts);
     activeWakeupPromises.add(promise);
+    activeWakeupAgents.set(promise, agentId);
     void promise.catch(() => {}).finally(() => {
       activeWakeupPromises.delete(promise);
+      activeWakeupAgents.delete(promise);
     });
     return promise;
   }
@@ -13986,6 +13997,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     activeRunExecutions.add(run.id);
+    activeRunAgents.set(run.id, run.agentId);
     let runScratch: HeartbeatRunScratch | null = null;
 
     try {
@@ -16011,6 +16023,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
             : undefined,
           runtimeMcp,
+          processAccounting: parseProcessAccountingPolicy(runtimeConfig.processAccounting),
           onLog,
           onMeta: onAdapterMeta,
           onEvent: onAdapterEvent,
@@ -16023,8 +16036,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
           },
           onTimeout: async () => {
-            processAdmissionHolds.add(run.id);
-            agentProcessAdmissionHolds.add(run.agentId);
+            markProcessAdmissionHold(run.agentId, run.id);
             await holdProcessCleanup(agent, run.id, "timeout_cleanup_requires_review");
           },
           onSpawn: async (meta) => {
@@ -16801,6 +16813,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           }
           activeRunExecutions.delete(run.id);
+          activeRunAgents.delete(run.id);
           processAdmissionHolds.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
@@ -18939,8 +18952,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
-    processAdmissionHolds.add(run.id);
-    agentProcessAdmissionHolds.add(run.agentId);
+    markProcessAdmissionHold(run.agentId, run.id);
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
     let resultJson = agent

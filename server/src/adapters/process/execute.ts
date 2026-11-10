@@ -68,6 +68,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     onLog,
     onSpawn: ctx.onSpawn,
     onTimeout: ctx.onTimeout,
+    processAccounting: ctx.processAccounting,
   });
 
   if (proc.timedOut) {

@@ -188,6 +188,7 @@ export interface AdapterExecutionContext {
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onTimeout?: () => Promise<void>;
+  processAccounting?: Omit<import("./process-accounting.js").ProcessAccountingOptions, "baseline">;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   authToken?: string;
   /**

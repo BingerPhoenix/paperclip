@@ -1,4 +1,5 @@
 import { hasProcessCleanupHold, releaseProcessCleanupHoldRequestSchema } from "../services/process-cleanup-hold.js";
+import { getLiveProcessAccounting } from "../adapters/utils.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -4984,6 +4985,16 @@ export function agentRoutes(
       ...heartbeat.decorateActiveRunStatus(run),
       outputSilence: await heartbeat.buildRunOutputSilence(run),
     }))));
+  });
+
+  router.get("/heartbeat-runs/:runId/process-accounting", async (req, res) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!run) return;
+    const live = getLiveProcessAccounting(runId);
+    const stored = readObject(readObject(run.resultJson)?.processCleanup)?.accounting ?? null;
+    res.json({ runId, phase: live ? "live" : stored ? "terminal" : "unavailable", accounting: live ?? stored });
   });
 
   router.get("/heartbeat-runs/:runId", async (req, res) => {
