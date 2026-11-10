@@ -66,7 +66,7 @@ describe("bounded owned process cleanup", () => {
   it("does not signal a reused PID", async () => {
     let start="original"; const signals:number[]=[];
     const tracker=trackOwnedProcesses({pid:101,exitCode:null,signalCode:null} as ChildProcess, {
-      snapshot:()=>[{pid:101,parent:1,start,state:"S"}], signal:(pid)=>{signals.push(pid);},
+      snapshot:()=>[{pid:101,parent:1,start,state:"S"}], signal:(pid)=>{signals.push(pid);return true;},
     });
     start="replacement"; const result=await tracker.stop(0);
     expect(signals).toEqual([]); expect(result.state).toBe("observed_gone");
