@@ -1,4 +1,4 @@
-import { processAdmissionHolds } from "../adapters/utils.js";
+import { processAdmissionHolds, agentProcessAdmissionHolds } from "../adapters/utils.js";
 import { hasProcessCleanupHold, processCleanupHoldMetadata } from "./process-cleanup-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -12490,7 +12490,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
       return null;
     }
-    if (hasProcessCleanupHold(agent)) return null;
+    if (agentProcessAdmissionHolds.has(agent.id) || hasProcessCleanupHold(agent)) return null;
     const invokability = companyAgents
       ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
       : await getAgentInvokability(agent);
@@ -13844,7 +13844,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
-      if (!agent || hasProcessCleanupHold(agent)) return [];
+      if (!agent || agentProcessAdmissionHolds.has(agentId) || hasProcessCleanupHold(agent)) return [];
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
@@ -16022,6 +16022,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           onRuntimeProgress: async (progress) => {
             await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
           },
+          onTimeout: async () => {
+            processAdmissionHolds.add(run.id);
+            agentProcessAdmissionHolds.add(run.agentId);
+            await holdProcessCleanup(agent, run.id, "timeout_cleanup_requires_review");
+          },
           onSpawn: async (meta) => {
             await persistRunProcessMetadata(run.id, {
               pid: meta.pid,
@@ -16811,6 +16816,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =
       recoveryAgent &&
+      !agentProcessAdmissionHolds.has(recoveryAgent.id) &&
       !hasProcessCleanupHold(recoveryAgent) &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
@@ -18934,6 +18940,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
     processAdmissionHolds.add(run.id);
+    agentProcessAdmissionHolds.add(run.agentId);
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
     let resultJson = agent
@@ -18955,7 +18962,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const running = runningProcesses.get(run.id);
     try {
       if (running) {
-        if (running.containment) cleanup = { ...await running.containment.stop(Math.max(1, running.graceSec) * 1000) };
+        if (running.containment) {
+          const observed = await running.containment.stop(Math.max(1, running.graceSec) * 1000);
+          cleanup = { ...observed };
+          running.finishStopped?.(observed);
+        }
         // No tracker means ownership is unproven. Do not signal a bare PID/group.
       } // No in-memory identity tracker: hold remains; never signal persisted PIDs.
     } catch {

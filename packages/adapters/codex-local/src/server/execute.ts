@@ -1295,6 +1295,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           timeoutSec,
           graceSec,
           onSpawn: wrappedOnSpawn,
+          onTimeout: ctx.onTimeout,
           onRuntimeProgress: ctx.onRuntimeProgress,
           onLog: async (stream, chunk) => {
             monitor?.noteOutputChunk(stream, chunk);

@@ -67,6 +67,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     graceSec,
     onLog,
     onSpawn: ctx.onSpawn,
+    onTimeout: ctx.onTimeout,
   });
 
   if (proc.timedOut) {

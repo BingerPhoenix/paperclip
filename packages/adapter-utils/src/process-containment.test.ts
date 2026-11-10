@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { runChildProcess, processAdmissionHolds } from "./server-utils.js";
@@ -22,6 +22,25 @@ describe("bounded owned process cleanup", () => {
     });
     expect(result.timedOut).toBe(true); expect(result.processCleanup?.state).toBe("observed_gone");
     expect(result.processCleanup?.scope).toBe("sampled_pid_start_identity");
+  },6000);
+  it("returns a finite non-pass with timeout hold before denied cleanup and inherited pipes", async () => {
+    let held=false; const original=process.kill;
+    const denied=vi.spyOn(process,"kill").mockImplementation(()=>{
+      expect(held).toBe(true);
+      throw Object.assign(new Error("fixture signal denial"),{code:"EPERM"});
+    });
+    const start=Date.now();
+    try {
+      const result=await runChildProcess("finite-denied-pipe",process.execPath,["-e",
+        "const{spawn}=require('node:child_process');spawn(process.execPath,['-e','setTimeout(()=>{},5000)'],{detached:true,stdio:['ignore','inherit','inherit']});console.log('partial-before-timeout');setTimeout(()=>process.exit(0),1000);"],{
+        cwd:process.cwd(),env:{},timeoutSec:0.2,graceSec:1,onLog:async()=>{},onTimeout:async()=>{held=true;},
+      });
+      expect(Date.now()-start).toBeLessThan(3000); expect(held).toBe(true);
+      expect(result.timedOut).toBe(true); expect(result.exitCode).toBe(null);
+      expect(result.stdout).toContain("partial-before-timeout");
+      expect(result.processCleanup?.state).toBe("unknown");
+      expect(result.processCleanup?.errors).toContain("signal_denied_or_unknown");
+    } finally { denied.mockRestore(); expect(process.kill).toBe(original); }
   },6000);
   it("fences a cancellation while asynchronous spawn preparation is pending", async () => {
     const id="finite-cancel-before-spawn"; let spawned=false;

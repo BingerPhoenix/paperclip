@@ -55,6 +55,7 @@ export interface TerminalResultCleanupEvidence {
 
 export interface RunningProcess {
   containment?: ReturnType<typeof trackOwnedProcesses>;
+  finishStopped?: (evidence: ProcessCleanupEvidence) => void;
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
@@ -111,6 +112,7 @@ export function signalRunningProcess(
 export const runningProcesses = new Map<string, RunningProcess>();
 // Ephemeral single-server fence; the agent metadata hold is the restart boundary.
 export const processAdmissionHolds = new Set<string>();
+export const agentProcessAdmissionHolds = new Set<string>();
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
@@ -3301,7 +3303,8 @@ export async function runChildProcess(
     graceSec: number;
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
-    onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    onTimeout?: () => Promise<void>;
+  onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -3340,7 +3343,7 @@ export async function runChildProcess(
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
-        if (processAdmissionHolds.has(runId)) {
+        if (processAdmissionHolds.has(runId) || agentProcessAdmissionHolds.has(opts.env.PAPERCLIP_AGENT_ID)) {
           void target.cleanup?.();
           throw new Error("Run cancellation prevents child process admission");
         }
@@ -3367,7 +3370,9 @@ export async function runChildProcess(
 
         const containment = trackOwnedProcesses(child);
         let processCleanup: Promise<ProcessCleanupEvidence> | null = null;
-        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId, containment });
+        runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId, containment,
+          finishStopped: (evidence) => { processCleanup = Promise.resolve(evidence); void settle(null, null, true); },
+        });
 
         let timedOut = false;
         let stdout = "";
@@ -3432,7 +3437,16 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
-                processCleanup = containment.stop(Math.max(1, opts.graceSec) * 1000);
+                processCleanup = (async () => {
+                  let holdFailed = false;
+                  try { await Promise.race([
+                    opts.onTimeout?.(),
+                    new Promise((_, rejectTimeout) => setTimeout(() => rejectTimeout(new Error("hold_timeout")), 1000)),
+                  ]); } catch { holdFailed = true; }
+                  const evidence = await containment.stop(Math.max(1, opts.graceSec) * 1000);
+                  return holdFailed ? { ...evidence, state: "unknown" as const, errors: [...evidence.errors, "timeout_hold_unconfirmed"] } : evidence;
+                })();
+                void processCleanup.then(() => settle(null, null, true));
               }, opts.timeoutSec * 1000)
             : null;
 
@@ -3496,39 +3510,42 @@ export async function runChildProcess(
           maybeArmTerminalResultCleanup();
         });
 
-        child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+        let settled = false;
+        async function settle(code: number | null, signal: NodeJS.Signals | null, forced = false) {
+          if (settled) return;
+          settled = true;
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          const cleanup = processCleanup ? await processCleanup : null;
+          containment.dispose();
           runningProcesses.delete(runId);
-          void logChain.finally(() => {
-            void Promise.resolve()
-              .then(() => processCleanup)
-              .then(() => { containment.dispose(); return target.cleanup?.(); })
-              .finally(async () => {
-              resolve({
-                exitCode: code,
-                signal,
-                timedOut,
-                stdout,
-                stderr,
-                pid: child.pid ?? null,
-                startedAt,
-                processCleanup: processCleanup ? await processCleanup : null,
-                terminalResultCleanup: terminalCleanupStarted
-                  ? {
-                    kind: "terminal_result_cleanup",
-                    stopped: true,
-                    stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-                    reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-                    terminalResultSeen,
-                    signal: terminalCleanupSignal,
-                    forceKilled: terminalCleanupForceKilled,
-                  }
-                  : null,
-              });
-              });
-          });
-        });
+          if (forced) {
+            // A surviving producer can keep inherited pipes open forever. End
+            // capture and return an explicit stopped/timeout result with unknown
+            // exit, without claiming the process or its descendants are gone.
+            child.stdout?.destroy(); child.stderr?.destroy(); child.stdin?.destroy(); child.unref();
+          }
+          if (forced || timedOut) await Promise.race([logChain, new Promise((r) => setTimeout(r, 100))]);
+          else await logChain;
+          const result: RunProcessResult = {
+            exitCode: forced ? null : code, signal: forced ? null : signal,
+            timedOut, stdout, stderr, pid: child.pid ?? null, startedAt,
+            processCleanup: cleanup,
+            terminalResultCleanup: terminalCleanupStarted ? {
+              kind: "terminal_result_cleanup", stopped: true,
+              stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+              reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+              terminalResultSeen, signal: terminalCleanupSignal, forceKilled: terminalCleanupForceKilled,
+            } : null,
+          };
+          if (forced || timedOut) {
+            void target.cleanup?.().catch((err) => onLogError(err, runId, "failed stopped target cleanup"));
+            resolve(result);
+          } else {
+            try { await target.cleanup?.(); } finally { resolve(result); }
+          }
+        }
+        child.on("close", (code: number | null, signal: NodeJS.Signals | null) => { void settle(code, signal); });
       })
       .catch(reject);
   });

@@ -27,5 +27,5 @@ for (const [name,timeout] of [['cancel',0],['timeout',0.4]]) {
   assert.equal((await api('PATCH',`/agents/${agent.id}`,{metadata:{},status:'idle'})).status,409);
   assert.equal(run.resultJson.processCleanup.state,'observed_gone');
   assert(run.resultJson.processCleanup.observed>=2);
-  console.log(JSON.stringify({case:name,status:run.status,exitCode:run.exitCode,cleanup:run.resultJson.processCleanup,agentStatus:state.status,resumeHTTP:409,clearHoldHTTP:409}));
+  console.log(JSON.stringify({case:name,companyId:company.id,agentId:agent.id,runId:run.id,status:run.status,exitCode:run.exitCode,cleanup:run.resultJson.processCleanup,agentStatus:state.status,resumeHTTP:409,clearHoldHTTP:409}));
 }
