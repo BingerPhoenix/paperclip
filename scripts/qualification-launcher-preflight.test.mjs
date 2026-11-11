@@ -31,7 +31,7 @@ function fixture() {
   const serviceIdentity = { pid: 500, start: 'service-start' };
   const accounting = { scope: 'bounded_sampled_process_accounting', state: 'bounded_observed', runId: expectedRunId,
     sourceCommit: declaration.sourceCommit, contractSha256: declaration.contractSha256, errors: [], expectedNativeStarts: 0, modelStartCount: 0,
-    sampleCount: 3, baselineDigest: 'b'.repeat(64), root: { pid: 501, start: 'fixture-start' },
+    sampleCount: 3, baselineDigest: 'b'.repeat(64), transitions: [], root: { pid: 501, start: 'fixture-start' },
     baselineProcesses: [{ ...serviceIdentity, executable: service.canonicalPath, classification: 'node_helper' }],
     observations: [{ pid: 501, start: 'fixture-start', parent: 500, owned: true, runId: expectedRunId,
       executable: effective.canonicalPath, classification: 'known_launcher', pinId: 'homebrew-node', artifactSha256: effective.sha256 }],
@@ -67,6 +67,34 @@ test('Node22-as-effective-launcher and unknown intended launchers reject admissi
     observation.classification = kind === 'node22' ? 'known_launcher' : 'unknown';
     assert.equal(verifyLauncherPreflight(candidate).state, 'rejected');
     assert.ok(verifyLauncherPreflight(candidate).errors.includes('effective_launcher_mismatch'));
+  }
+}));
+
+test('exact pinned pre-existing baseline native identity is retained without consuming a model start', () => run(value => {
+  const native = value.declaration.artifacts.find(item => item.classification === 'native_model');
+  value.accounting.baselineProcesses.push({ pid: 400, start: 'existing-native', parent: 1,
+    executable: native.canonicalPath, classification: 'native_model' });
+  value.accounting.observations.push({ pid: 400, start: 'existing-native', parent: 1, owned: false,
+    runId: value.expectedRunId, executable: native.canonicalPath, classification: 'native_model',
+    pinId: native.id, artifactSha256: native.sha256 });
+  assert.equal(value.accounting.modelStartCount, 0);
+  assert.equal(verifyLauncherPreflight(value).state, 'passed');
+  const mutations = [
+    candidate => { candidate.accounting.observations[1].pid = 401; },
+    candidate => { candidate.accounting.observations[1].start = 'reused-start'; },
+    candidate => { candidate.accounting.observations[1].executable = '/unopened/changed-native'; },
+    candidate => { candidate.accounting.observations[1].artifactSha256 = 'c'.repeat(64); },
+    candidate => { candidate.accounting.observations[1].pinId = 'unbound-native'; },
+    candidate => { candidate.accounting.observations[1].owned = true; },
+    candidate => { candidate.accounting.observations[1].runId = 'other-run'; },
+    candidate => { candidate.accounting.baselineProcesses[1].classification = 'unknown'; },
+    candidate => { candidate.accounting.transitions.push({ kind: 'exec_change', pid: 400, start: 'existing-native', previousStart: 'existing-native' }); },
+    candidate => { candidate.accounting.transitions.push({ kind: 'pid_reuse', pid: 400, start: 'replacement', previousStart: 'existing-native' }); },
+  ];
+  for (const mutate of mutations) {
+    const candidate = structuredClone(value); mutate(candidate);
+    assert.equal(candidate.accounting.modelStartCount, 0);
+    assert.equal(verifyLauncherPreflight(candidate).state, 'rejected');
   }
 }));
 

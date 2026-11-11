@@ -135,6 +135,19 @@ export function verifyLauncherPreflight({ declaration, accounting, receipt, offi
   const observed = rootObservations.at(-1);
   const service = artifacts.find(item => item.id === 'node22');
   const serviceBaseline = Array.isArray(accounting?.baselineProcesses) ? accounting.baselineProcesses.find(item => item.pid === serviceIdentity?.pid && item.start === serviceIdentity?.start) : null;
+  const unexpectedNative = observations.some(item => {
+    if (item.classification !== 'native_model') return false;
+    const declared = artifacts.find(pin => pin.classification === 'native_model' && pin.canonicalPath === item.executable && pin.sha256 === item.artifactSha256);
+    const pinned = Array.isArray(accounting?.pins) && accounting.pins.some(pin => pin.id === item.pinId && pin.path === item.executable &&
+      pin.sha256 === item.artifactSha256 && pin.classification === 'native_model');
+    const baseline = Array.isArray(accounting?.baselineProcesses) && accounting.baselineProcesses.some(row => row.pid === item.pid &&
+      row.start === item.start && row.executable === item.executable && row.classification === 'native_model');
+    const unchanged = Array.isArray(accounting?.transitions) && !accounting.transitions.some(change => change.pid === item.pid &&
+      (change.start === item.start || change.previousStart === item.start) && (change.kind === 'exec_change' || change.kind === 'pid_reuse'));
+    // Existing baseline models are retained by the observer, not new starts.
+    // No broad exemption for unowned models or a caller-supplied zero count.
+    return !declared || !pinned || !baseline || !unchanged || item.owned !== false || item.runId !== expectedRunId;
+  });
   if (accountingOrigin !== 'external_observer_bound_official_spawn') errors.push('unsupported_accounting_origin');
   if (officialInvocation?.adapterType !== 'codex_local' || officialInvocation?.engine !== 'cli' || officialInvocation?.transport !== 'local' ||
       officialInvocation?.runId !== expectedRunId || officialInvocation?.rootPid !== root?.pid ||
@@ -144,7 +157,7 @@ export function verifyLauncherPreflight({ declaration, accounting, receipt, offi
   if (accounting?.runId !== expectedRunId || accounting?.state !== 'bounded_observed' || accounting?.scope !== 'bounded_sampled_process_accounting' ||
       accounting?.expectedNativeStarts !== 0 || accounting?.modelStartCount !== 0 || !Array.isArray(accounting?.errors) || accounting.errors.length ||
       !Number.isSafeInteger(accounting?.sampleCount) || accounting.sampleCount < 1 || !hex(accounting?.baselineDigest) ||
-      !Array.isArray(accounting?.observations) || accounting.observations.some(item => item.classification === 'native_model' || (item.owned && item.classification === 'unknown'))) errors.push('accounting_not_zero_model_pass');
+      !Array.isArray(accounting?.observations) || unexpectedNative || accounting.observations.some(item => item.owned && item.classification === 'unknown')) errors.push('accounting_not_zero_model_pass');
   if (!Number.isSafeInteger(serviceIdentity?.pid) || !safe(serviceIdentity?.start) || serviceBaseline?.executable !== service?.canonicalPath ||
       serviceBaseline?.classification !== 'node_helper' || observed?.parent !== serviceIdentity.pid) errors.push('service_node_binding_mismatch');
   for (const artifact of artifacts) {
