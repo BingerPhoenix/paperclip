@@ -132,7 +132,7 @@ export function parseProcessAccountingPolicy(value: unknown): ProcessAccountingP
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid process accounting policy");
   const policy = value as Record<string, unknown>;
-  const allowed = new Set(["sourceCommit", "contractSha256", "pins", "expectedNativeStarts", "rootLauncherPinId", "bounds"]);
+  const allowed = new Set(["sourceCommit", "contractSha256", "pins", "expectedNativeStarts", "rootLauncherPinId", "bounds", "rootChildExecTransition"]);
   if (Object.keys(policy).some((key) => !allowed.has(key))
     || typeof policy.sourceCommit !== "string" || !/^[a-f0-9]{40}$/.test(policy.sourceCommit)
     || typeof policy.contractSha256 !== "string" || !/^[a-f0-9]{64}$/.test(policy.contractSha256)
