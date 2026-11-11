@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import type { ProcessIdentity } from "./process-containment.js";
 
 export type ExecutableClassification = "native_model" | "known_launcher" | "node_helper" |
@@ -18,8 +19,18 @@ export interface ProcessAccountingOptions {
   pins: ExecutablePin[];
   expectedNativeStarts: number;
   rootLauncherPinId?: string;
+  rootChildExecTransition?: RootChildExecTransitionPolicy;
   bounds?: { maxGapMs?: number; maxSamples?: number; maxProcesses?: number;
     maxObservations?: number; maxTransitions?: number };
+}
+export interface RootChildExecTransitionPolicy {
+  parentPinId: string; helperPinId: string; deadlineMs: number;
+  sourceCommit: string; sourceEvidenceSha256: string;
+}
+export interface ChildExecTransitionEvidence {
+  runId: string; pid: number; start: string; parent: number; parentStart: string;
+  fromPinId: string; helperPinId: string; firstObservedAt: string; deadlineAt: string;
+  state: "pending" | "resolved_helper" | "rejected"; resolvedAt?: string; reason?: string;
 }
 export interface ClassifiedProcessIdentity {
   pid: number; start: string; parent: number; executable: string | null;
@@ -50,6 +61,9 @@ export interface ProcessAccountingEvidence {
   bounds: Required<NonNullable<ProcessAccountingOptions["bounds"]>>;
   observations: ProcessObservation[];
   transitions: ProcessTransition[];
+  rootChildExecTransition?: RootChildExecTransitionPolicy;
+  observedNativeImageStarts?: number;
+  childExecTransitions?: ChildExecTransitionEvidence[];
   limitations: string[];
 }
 export interface ProcessAccountingObserver {
@@ -109,11 +123,25 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
   if (options.rootLauncherPinId && !pins.some((p) => p.id === options.rootLauncherPinId && p.classification !== "native_model")) {
     throw new Error("invalid_root_launcher_pin");
   }
+  const childRule = options.rootChildExecTransition;
+  if (childRule !== undefined && (!childRule || typeof childRule !== "object" || Array.isArray(childRule) ||
+      Object.keys(childRule).some((k) => !["parentPinId", "helperPinId", "deadlineMs", "sourceCommit", "sourceEvidenceSha256"].includes(k)) ||
+      options.expectedNativeStarts !== 1 || !Number.isSafeInteger(childRule.deadlineMs) || childRule.deadlineMs < 1 || childRule.deadlineMs > 1000 ||
+      !/^[a-f0-9]{40}$/.test(childRule.sourceCommit) || !/^[a-f0-9]{64}$/.test(childRule.sourceEvidenceSha256) ||
+      !pins.some((p) => p.id === childRule.parentPinId && p.classification === "native_model") ||
+      !pins.some((p) => p.id === childRule.helperPinId && p.classification === "declared_helper"))) {
+    throw new Error("invalid_root_child_exec_transition");
+  }
   let runId: string | null = null;
   let rootPid: number | null = null;
   let root: { pid: number; start: string } | null = null;
   let sampleCount = 0;
   let modelStartCount = 0;
+  let observedNativeImageStarts = 0;
+  let previousSnapshotComplete = false;
+  let previousMonotonic: number | null = null;
+  const childExecTransitions: ChildExecTransitionEvidence[] = [];
+  let childCandidate: { record: ChildExecTransitionEvidence; firstMonotonic: number; parentParent: number } | null = null;
   let previousAt = Date.parse(options.baseline.observedAt);
   let maxObservedGapMs = 0;
   const owned = new Set<string>();
@@ -134,6 +162,9 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
     rows.every(validRow) && new Set(rows.map((row) => row.pid)).size === rows.length;
   const baseline = options.baseline.processes;
   if (!validSnapshot(baseline)) throw new Error("invalid_process_accounting_baseline");
+  // Freshness cannot rely on latest/scoped rows: an earlier unowned PID may
+  // disappear and later reparent. Opt-in history is bounded and never evicted.
+  const seenHostPids = childRule ? new Set(baseline.map((row) => row.pid)) : null;
   const baselineProcesses = baseline.map((row) => {
     latest.set(key(row), { ...row }); latestPid.set(row.pid, { ...row });
     const { pinId: _pinId, artifactSha256: _sha, ...safe } = classify(row);
@@ -145,6 +176,27 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
     if (transitions.length >= bounds.maxTransitions) { errors.add("transition_limit"); return; }
     transitions.push({ kind, observedAt: at, pid: row.pid, start: row.start, previousStart: old.start,
       fromExecutable: old.executable ?? null, toExecutable: row.executable ?? null });
+  };
+  const countNative = (isOwned: boolean) => {
+    modelStartCount++;
+    if (!isOwned) errors.add("unexpected_model_start");
+    if (modelStartCount > options.expectedNativeStarts) errors.add("native_start_budget_exceeded");
+  };
+  const rejectChild = (reason: string) => {
+    if (childCandidate?.record.state !== "pending") return;
+    childCandidate.record.state = "rejected"; childCandidate.record.reason = reason;
+    errors.add(`child_exec_transition_${reason}`);
+    // The unresolved image was deferred, never deducted from a committed count.
+    countNative(true);
+  };
+  const expireChild = (now: number, at?: number) => {
+    if (!childRule) return;
+    if (!Number.isFinite(now) || (previousMonotonic !== null && now < previousMonotonic)) {
+      errors.add("monotonic_clock_invalid"); rejectChild("clock_invalid");
+    } else previousMonotonic = now;
+    if (childCandidate?.record.state === "pending" &&
+        (now - childCandidate.firstMonotonic >= childRule.deadlineMs ||
+         (at !== undefined && at >= Date.parse(childCandidate.record.deadlineAt)))) rejectChild("deadline_exceeded");
   };
   return {
     rejectAdmission() { errors.add("additional_process_admission_rejected"); },
@@ -161,16 +213,23 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
       if (sampleCount) errors.add("root_bound_after_observation");
     },
     observe(snapshot) {
+      const monotonicNow = performance.now();
+      const priorComplete = previousSnapshotComplete; previousSnapshotComplete = false;
+      expireChild(monotonicNow);
       sampleCount++;
-      if (sampleCount > bounds.maxSamples) { errors.add("sample_limit"); return; }
-      if (!snapshot || !timestamp(snapshot.observedAt)) { errors.add("invalid_snapshot_time"); return; }
+      if (sampleCount > bounds.maxSamples) { errors.add("sample_limit"); rejectChild("missing_observation"); return; }
+      if (!snapshot || !timestamp(snapshot.observedAt)) { errors.add("invalid_snapshot_time"); rejectChild("missing_observation"); return; }
       const at = Date.parse(snapshot.observedAt);
       const gap = at - previousAt;
       if (gap < 0) errors.add("snapshot_time_reversed");
       if (gap > bounds.maxGapMs) errors.add("snapshot_gap");
       maxObservedGapMs = Math.max(maxObservedGapMs, gap); previousAt = Math.max(previousAt, at);
       if (snapshot.complete === false) errors.add("snapshot_incomplete");
-      if (!validSnapshot(snapshot.processes)) { errors.add("invalid_or_oversize_snapshot"); return; }
+      expireChild(monotonicNow, at);
+      if (!validSnapshot(snapshot.processes)) { errors.add("invalid_or_oversize_snapshot"); rejectChild("missing_observation"); return; }
+      if (seenHostPids && seenHostPids.size + snapshot.processes.filter((row) => !seenHostPids.has(row.pid)).length > bounds.maxProcesses) {
+        errors.add("child_exec_transition_history_limit"); rejectChild("history_limit");
+      }
       for (const pin of pins) {
         try { if (fingerprint(pin.path) !== pin.fingerprint || realpathSync(pin.originalPath) !== pin.path) errors.add("executable_pin_changed"); }
         catch { errors.add("executable_pin_unavailable"); }
@@ -183,6 +242,7 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
           ? { ...row, executable: previous.executable } : row;
       });
       const byPid = new Map(rows.map((row) => [row.pid, row]));
+      const priorRoot = root ? latest.get(`${root.pid}:${root.start}`) : undefined;
       if (!root && rootPid !== null) {
         const row = byPid.get(rootPid);
         if (row) { root = { pid: row.pid, start: row.start }; owned.add(key(row)); }
@@ -198,6 +258,30 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
             if (owned.size >= bounds.maxObservations) { errors.add("owned_identity_limit"); continue; }
             owned.add(key(row)); changed = true;
           }
+        }
+      }
+      if (childCandidate?.record.state === "pending") {
+        const record = childCandidate.record;
+        const child = byPid.get(record.pid), parent = byPid.get(record.parent);
+        if (errors.size) rejectChild("invalid_observation");
+        else if (!child) rejectChild("missing_observation");
+        else if (child.start !== record.start) rejectChild("identity_reused");
+        else if (!parent || parent.start !== record.parentStart || parent.parent !== childCandidate.parentParent ||
+            parent.state.startsWith("Z") || classify(parent).pinId !== childRule!.parentPinId) rejectChild("parent_changed");
+        else if (child.parent !== record.parent) rejectChild("reparented");
+        else if (child.state.startsWith("Z")) rejectChild("terminal_before_helper");
+        else {
+          const image = classify(child);
+          if (image.pinId === childRule!.helperPinId && image.classification === "declared_helper") {
+            record.state = "resolved_helper"; record.resolvedAt = snapshot.observedAt;
+          } else if (image.pinId !== record.fromPinId || image.classification !== "native_model") rejectChild("wrong_executable");
+        }
+      }
+      if (childCandidate?.record.state === "resolved_helper") {
+        const child = byPid.get(childCandidate.record.pid);
+        if (child && (child.start !== childCandidate.record.start || classify(child).pinId !== childRule!.helperPinId)) {
+          // A proven startup target does not authorize later images or PID reuse.
+          errors.add("child_exec_transition_helper_changed");
         }
       }
       for (const row of rows) {
@@ -219,9 +303,26 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
           if (isOwned && current.classification === "unknown") errors.add("unknown_owned_executable");
           const oldClass = old ? classify(old) : null;
           if (native && (!old || oldClass?.classification !== "native_model" || oldClass.pinId !== current.pinId)) {
-            modelStartCount++;
-            if (!isOwned) errors.add("unexpected_model_start");
-            if (modelStartCount > options.expectedNativeStarts) errors.add("native_start_budget_exceeded");
+            observedNativeImageStarts++;
+            const parent = root ? byPid.get(root.pid) : undefined;
+            if (childRule && !childExecTransitions.length && !errors.size && priorComplete && modelStartCount === 1 &&
+                isOwned && root && row.pid !== root.pid && row.parent === root.pid && !old && !oldPid &&
+                !seenHostPids!.has(row.pid) && !observations.some((r) => r.pid === row.pid) &&
+                !row.state.startsWith("Z") && priorRoot && parent && parent.start === root.start &&
+                priorRoot.start === parent.start && priorRoot.parent === parent.parent && !parent.state.startsWith("Z") &&
+                classify(priorRoot).pinId === childRule.parentPinId && classify(parent).pinId === childRule.parentPinId &&
+                current.pinId === childRule.parentPinId) {
+              const record: ChildExecTransitionEvidence = { runId: runId!, pid: row.pid, start: row.start,
+                parent: parent.pid, parentStart: parent.start, fromPinId: current.pinId!, helperPinId: childRule.helperPinId,
+                firstObservedAt: snapshot.observedAt, deadlineAt: new Date(at + childRule.deadlineMs).toISOString(), state: "pending" };
+              childExecTransitions.push(record);
+              childCandidate = { record, firstMonotonic: monotonicNow, parentParent: parent.parent };
+            } else {
+              countNative(isOwned);
+              if (childCandidate?.record.state === "resolved_helper" && rowKey === `${childCandidate.record.pid}:${childCandidate.record.start}`) {
+                errors.add("child_exec_transition_helper_regressed");
+              }
+            }
           }
           const previous = lastObservation.get(rowKey);
           if (previous && previous.executable === current.executable && previous.classification === current.classification) {
@@ -239,12 +340,18 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
       }
       latest.clear(); latestPid.clear();
       for (const row of rows) { latest.set(key(row), { ...row }); latestPid.set(row.pid, { ...row }); }
+      previousSnapshotComplete = snapshot.complete !== false;
+      if (seenHostPids) for (const row of rows) {
+        if (seenHostPids.has(row.pid) || seenHostPids.size < bounds.maxProcesses) seenHostPids.add(row.pid);
+      }
     },
     evidence() {
+      expireChild(performance.now());
       const allErrors = new Set(errors);
       if (!runId || !root) allErrors.add("root_identity_unavailable");
       if (!sampleCount) allErrors.add("no_post_admission_snapshot");
       if (modelStartCount !== options.expectedNativeStarts) allErrors.add("model_start_count_mismatch");
+      if (childCandidate?.record.state === "pending") allErrors.add("child_exec_transition_pending");
       return structuredClone({ scope: "bounded_sampled_process_accounting" as const,
         state: allErrors.size ? "unknown" as const : "bounded_observed" as const,
         runId, root, expectedNativeStarts: options.expectedNativeStarts, modelStartCount,
@@ -252,6 +359,7 @@ export function createProcessAccounting(options: ProcessAccountingOptions): Proc
         sourceCommit: options.sourceCommit, contractSha256: options.contractSha256,
         baselineProcesses, pins: pins.map(({ originalPath: _original, fingerprint: _fingerprint, ...pin }) => pin),
         sampleCount, maxObservedGapMs, bounds, observations, transitions,
+        ...(childRule ? { rootChildExecTransition: childRule, observedNativeImageStarts, childExecTransitions } : {}),
         limitations: ["bounded observations only; transient or reparented-before-capture processes may be missed",
           "unrelated unpinned host processes are outside owned scope; new pinned native starts are counted globally",
           "declared artifact hashes identify sampled paths, not an attested in-memory executable image"] });
