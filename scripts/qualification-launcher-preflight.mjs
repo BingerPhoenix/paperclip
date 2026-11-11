@@ -30,6 +30,7 @@ const safe = value => typeof value === 'string' && value.length > 0 && value.len
   !/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(value);
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const commit = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
+const timestamp = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value) && Number.isFinite(Date.parse(value));
 const fail = code => { throw new Error(code); };
 const fingerprint = stat => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 function artifact(id, path, classification, maxBytes = 512 * 1024 * 1024) {
@@ -124,6 +125,32 @@ export function validateLauncherDeclaration(declaration) {
   return true;
 }
 
+// Prospective, frozen two-stage chain only. Env is optional because sampling
+// may miss it; env alone can never satisfy this final zero-model fixture gate.
+function launcherChainValid({ accounting, observations, artifacts, root, serviceIdentity, expectedRunId }) {
+  if (!root || !Array.isArray(accounting?.transitions)) return false;
+  const stages = observations.filter(item => item.pid === root.pid && item.start === root.start);
+  if (stages.length < 1 || stages.length > 2 || observations.some(item => item.owned && (item.pid !== root.pid || item.start !== root.start))) return false;
+  const node = artifacts.find(item => item.id === 'homebrew-node');
+  const env = artifacts.find(item => item.id === 'env-helper');
+  const pinned = (item, artifact, classification) => artifact && item.executable === artifact.canonicalPath &&
+    item.artifactSha256 === artifact.sha256 && Array.isArray(accounting.pins) && accounting.pins.some(pin =>
+      pin.id === item.pinId && pin.path === artifact.canonicalPath && pin.sha256 === artifact.sha256 && pin.classification === classification);
+  if (stages.some(item => item.owned !== true || item.runId !== expectedRunId || item.parent !== serviceIdentity?.pid ||
+      !timestamp(item.firstObservedAt) || !timestamp(item.lastObservedAt) || Date.parse(item.firstObservedAt) > Date.parse(item.lastObservedAt))) return false;
+  const final = stages.at(-1);
+  if (final.classification !== 'known_launcher' || final.pinId !== 'homebrew-node' || !pinned(final, node, 'node_helper')) return false;
+  const changes = accounting.transitions.filter(change => change.pid === root.pid);
+  if (stages.length === 1) return changes.length === 0;
+  const initial = stages[0];
+  if (initial.classification !== 'declared_helper' || !pinned(initial, env, 'declared_helper') ||
+      Date.parse(initial.lastObservedAt) > Date.parse(final.firstObservedAt) || changes.length !== 1) return false;
+  const change = changes[0];
+  return change.kind === 'exec_change' && change.start === root.start && change.previousStart === root.start &&
+    change.fromExecutable === env.canonicalPath && change.toExecutable === node.canonicalPath &&
+    timestamp(change.observedAt) && Date.parse(change.observedAt) === Date.parse(final.firstObservedAt);
+}
+
 export function verifyLauncherPreflight({ declaration, accounting, receipt, officialInvocation, expectedRunId, serviceIdentity, sourceCommit, contractSha256, accountingOrigin }) {
   const errors = [];
   try { validateLauncherDeclaration(declaration); } catch { errors.push('declaration_invalid_or_changed'); }
@@ -166,8 +193,7 @@ export function verifyLauncherPreflight({ declaration, accounting, receipt, offi
   }
   if (!Number.isSafeInteger(root?.pid) || root.pid < 1 || !safe(root?.start) || !observed?.owned || observed.runId !== expectedRunId ||
       observed.classification !== 'known_launcher' || observed.pinId !== 'homebrew-node' || observed.executable !== expected?.canonicalPath ||
-      observed.artifactSha256 !== expected?.sha256 || rootObservations.some(item => item.classification !== 'known_launcher' ||
-        item.executable !== expected?.canonicalPath || item.artifactSha256 !== expected?.sha256 || item.pinId !== 'homebrew-node')) errors.push('effective_launcher_mismatch');
+      observed.artifactSha256 !== expected?.sha256 || !launcherChainValid({ accounting, observations, artifacts, root, serviceIdentity, expectedRunId })) errors.push('effective_launcher_mismatch');
   if (receipt?.schema !== 'qualification-launcher-fixture-v1' || receipt?.declarationSha256 !== declaration?.declarationSha256 ||
       receipt?.sourceCommit !== sourceCommit || receipt?.contractSha256 !== contractSha256 || receipt?.root?.pid !== root?.pid ||
       receipt?.root?.executable !== expected?.canonicalPath || receipt?.root?.parent !== serviceIdentity?.pid ||

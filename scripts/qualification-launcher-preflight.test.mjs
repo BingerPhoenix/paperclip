@@ -34,6 +34,7 @@ function fixture() {
     sampleCount: 3, baselineDigest: 'b'.repeat(64), transitions: [], root: { pid: 501, start: 'fixture-start' },
     baselineProcesses: [{ ...serviceIdentity, executable: service.canonicalPath, classification: 'node_helper' }],
     observations: [{ pid: 501, start: 'fixture-start', parent: 500, owned: true, runId: expectedRunId,
+      firstObservedAt: '2026-11-11T03:00:00.100Z', lastObservedAt: '2026-11-11T03:00:00.200Z',
       executable: effective.canonicalPath, classification: 'known_launcher', pinId: 'homebrew-node', artifactSha256: effective.sha256 }],
     pins: declaration.artifacts.filter(item => item.classification !== 'declared_script').map(item => ({ id: item.id, path: item.canonicalPath, sha256: item.sha256, classification: item.classification })) };
   const receipt = { schema: 'qualification-launcher-fixture-v1', declarationSha256: declaration.declarationSha256,
@@ -48,6 +49,17 @@ function fixture() {
 function run(check) {
   const value = fixture();
   try { check(value); } finally { rmSync(value.directory, { recursive: true, force: true }); }
+}
+
+function withEnv(value) {
+  const node = value.accounting.observations[0];
+  const env = value.declaration.artifacts.find(item => item.id === 'env-helper');
+  value.accounting.observations.unshift({ ...node, executable: env.canonicalPath, artifactSha256: env.sha256,
+    classification: 'declared_helper', pinId: env.id,
+    firstObservedAt: '2026-11-11T03:00:00.000Z', lastObservedAt: '2026-11-11T03:00:00.050Z' });
+  value.accounting.transitions.push({ kind: 'exec_change', pid: 501, start: 'fixture-start', previousStart: 'fixture-start',
+    fromExecutable: env.canonicalPath, toExecutable: node.executable, observedAt: node.firstObservedAt });
+  return value;
 }
 
 test('declared script/symlink/shebang and source mapping distinguish service from effective Node', () => run(value => {
@@ -143,4 +155,55 @@ test('actual non-model fixture rejects a mismatched interpreter with finite sani
   assert.deepEqual(JSON.parse(child.stdout.trim()), { type: 'error', message: 'launcher_preflight_rejected' });
   assert.ok(!`${child.stdout}${child.stderr}`.includes('ARGUMENT-CANARY-PRIVATE'));
   assert.equal(readFileSync(script, 'utf8').split('\n')[0], '#!/usr/bin/env node');
+}));
+
+// Independent matrix sealed BEFORE this phase change:
+// 2a366384486e7fd0e59aef42aa33ed9631baefc1938c3561183a463b3c0e6cac.
+// These test the final zero-model evaluator. Pending native monitoring remains
+// root-owned and separate; env-only never passes this final evaluator.
+const phaseCases = [
+  ['node-only', true, value => value],
+  ['exact-env-then-node', true, withEnv],
+  ['env-only', false, value => { withEnv(value); value.accounting.observations.pop(); }],
+  ['unknown-before-node', false, value => { withEnv(value); value.accounting.observations[0].classification = 'unknown'; }],
+  ['env-path-or-hash-mismatch', false, value => { withEnv(value); value.accounting.observations[0].artifactSha256 = 'c'.repeat(64); }],
+  ['env-pin-missing-or-wrong-class', false, value => { withEnv(value); value.accounting.pins = value.accounting.pins.filter(pin => pin.id !== 'env-helper'); }],
+  ['pid-start-parent-run-mismatch', false, value => { withEnv(value); value.accounting.observations[0].start = 'other-start'; }],
+  ['node-then-env-or-env-after-node', false, value => { withEnv(value); value.accounting.observations.reverse(); }],
+  ['node-then-env-then-node', false, value => { withEnv(value); value.accounting.observations.unshift({ ...value.accounting.observations[1] }); }],
+  ['env-or-node-root-reuse-or-reparent', false, value => { withEnv(value); value.accounting.transitions.push({ kind: 'reparent', pid: 501, start: 'fixture-start', previousStart: 'fixture-start' }); }],
+  ['missing-or-extra-or-wrong-exec-transition', false, value => { withEnv(value); value.accounting.transitions = []; }],
+  ['native-count-one-before-proven-node', false, value => { withEnv(value); value.accounting.observations.pop(); value.accounting.modelStartCount = 1; }],
+  ['unknown-owned-or-extra-accounting-error', false, value => { withEnv(value); value.accounting.errors.push('snapshot_gap'); }],
+  ['later-model-count-regression', false, value => { withEnv(value); value.accounting.observations.push({ ...value.accounting.observations[1], classification: 'native_model' }); value.accounting.modelStartCount = 0; }],
+];
+for (const [id, passes, mutate] of phaseCases) {
+  test(`sealed launcher phase: ${id}`, () => run(value => {
+    mutate(value);
+    assert.equal(verifyLauncherPreflight(value).state, passes ? 'passed' : 'rejected');
+  }));
+}
+
+test('env binding, chronology and transition variants fail without an unknown-helper exemption', () => run(value => {
+  withEnv(value);
+  const mutations = [
+    candidate => { candidate.accounting.observations[0].executable = '/unopened/env'; },
+    candidate => { candidate.accounting.observations[0].pinId = 'wrong-env-pin'; },
+    candidate => { candidate.accounting.pins.find(pin => pin.id === 'env-helper').classification = 'node_helper'; },
+    candidate => { candidate.accounting.observations[0].pid = 999; },
+    candidate => { candidate.accounting.observations[0].parent = 999; },
+    candidate => { candidate.accounting.observations[0].owned = false; },
+    candidate => { candidate.accounting.observations[0].runId = 'other-run'; },
+    candidate => { candidate.accounting.observations[0].lastObservedAt = '2026-11-11T03:00:00.150Z'; },
+    candidate => { candidate.accounting.observations[1].firstObservedAt = 'invalid'; },
+    candidate => { candidate.accounting.transitions.push({ ...candidate.accounting.transitions[0] }); },
+    candidate => { candidate.accounting.transitions[0].fromExecutable = '/unopened/other'; },
+    candidate => { candidate.accounting.transitions[0].previousStart = 'reused-start'; },
+    candidate => { candidate.accounting.transitions[0].observedAt = '2026-11-11T03:00:00.150Z'; },
+    candidate => { candidate.accounting.transitions[0].kind = 'pid_reuse'; },
+  ];
+  for (const mutate of mutations) { const candidate = structuredClone(value); mutate(candidate); assert.equal(verifyLauncherPreflight(candidate).state, 'rejected'); }
+  // Sampling timestamps may meet exactly, but cannot overlap or reverse.
+  value.accounting.observations[0].lastObservedAt = value.accounting.observations[1].firstObservedAt;
+  assert.equal(verifyLauncherPreflight(value).state, 'passed');
 }));
