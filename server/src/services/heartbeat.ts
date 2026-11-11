@@ -1,3 +1,5 @@
+import { processAdmissionHolds, agentProcessAdmissionHolds, markProcessAdmissionHold, parseProcessAccountingPolicy, getRetainedProcessEvidence, forgetRetainedProcessEvidence } from "../adapters/utils.js";
+import { hasProcessCleanupHold, processCleanupHoldMetadata } from "./process-cleanup-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
@@ -776,6 +778,7 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+const activeRunAgents = new Map<string, string>();
 // Background heartbeat executions are dispatched fire-and-forget (see
 // startNextQueuedRunForAgent), so the promise that resolves once a run's DB
 // writes are fully flushed is otherwise unobservable. Track those promises here
@@ -793,6 +796,12 @@ const activeRunExecutionPromises = new Set<Promise<void>>();
 // can await a wake that is still before run registration. A caller that tears
 // down a shared database (a test afterEach) then cannot race a late wake.
 const activeWakeupPromises = new Set<Promise<unknown>>();
+const activeWakeupAgents = new Map<Promise<unknown>, string>();
+
+/** Includes asynchronous public wake prologues and terminal runs still flushing. */
+export function isProcessCleanupRuntimeIdle(agentId: string): boolean {
+  return ![...activeRunAgents.values(), ...activeWakeupAgents.values()].includes(agentId);
+}
 const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
@@ -7083,6 +7092,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function holdProcessCleanup(agent: typeof agents.$inferSelect, runId: string, reason: string) {
+    const metadata = processCleanupHoldMetadata(null, runId, reason,
+      parseObject(agent.adapterConfig).processAccounting !== undefined || !!getRetainedProcessEvidence(runId));
+    markProcessAdmissionHold(agent.id, runId, metadata.processCleanupHold.holdId);
+    const hold = JSON.stringify(metadata);
+    await db.update(agents).set({
+      status: sql`case when ${agents.status} = 'terminated' then 'terminated' else 'paused' end`,
+      metadata: sql`coalesce(${agents.metadata}, '{}'::jsonb) || ${hold}::jsonb`,
+      updatedAt: new Date(),
+    }).where(eq(agents.id, agent.id));
+  }
+
+  async function holdAccountedExecutionForReview(agent: typeof agents.$inferSelect, runId: string) {
+    if (parseObject(agent.adapterConfig).processAccounting === undefined) return;
+    const current = await getAgent(agent.id);
+    if (current && !hasProcessCleanupHold(current)) {
+      await holdProcessCleanup(current, runId, "accounted_execution_requires_review");
+    }
+  }
+
   async function getAgentInvokability(agent: typeof agents.$inferSelect | null | undefined) {
     return evaluateAgentInvokabilityFromDb(db, agent);
   }
@@ -12479,6 +12508,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
       return null;
     }
+    if (agentProcessAdmissionHolds.has(agent.id) || hasProcessCleanupHold(agent)) return null;
     const invokability = companyAgents
       ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
       : await getAgentInvokability(agent);
@@ -12946,7 +12976,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      .where(and(eq(agents.id, agentId), sql`${agents.status} not in ('paused', 'terminated')`, sql`not (coalesce(${agents.metadata}, '{}'::jsonb) ? 'processCleanupHold')`))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -13511,6 +13541,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      if (tracksLocalChild && (run.processPid || run.processGroupId)) {
+        const orphanAgent = await getAgent(run.agentId);
+        if (orphanAgent) await holdProcessCleanup(orphanAgent, run.id, "restart_process_identity_unknown");
+        // Persisted PID/group alone cannot establish ownership after restart. Do not
+        // signal or automatically retry it, even if the original root has exited.
+        continue;
+      }
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (
@@ -13825,7 +13862,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
-      if (!agent) return [];
+      if (!agent || agentProcessAdmissionHolds.has(agentId) || hasProcessCleanupHold(agent)) return [];
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
@@ -13943,8 +13980,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ): ReturnType<typeof enqueueWakeup> {
     const promise = enqueueWakeup(agentId, opts);
     activeWakeupPromises.add(promise);
+    activeWakeupAgents.set(promise, agentId);
     void promise.catch(() => {}).finally(() => {
       activeWakeupPromises.delete(promise);
+      activeWakeupAgents.delete(promise);
     });
     return promise;
   }
@@ -13955,6 +13994,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
+    if (hasProcessCleanupHold(await getAgent(run.agentId))) return;
 
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
@@ -13966,6 +14006,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     activeRunExecutions.add(run.id);
+    activeRunAgents.set(run.id, run.agentId);
     let runScratch: HeartbeatRunScratch | null = null;
 
     try {
@@ -15975,6 +16016,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (managedMcpConfig) {
           adapterContext.paperclipManagedMcp = managedMcpConfig;
         }
+        const latestAdmissionAgent = await getAgent(run.agentId);
+        if (hasProcessCleanupHold(latestAdmissionAgent) || latestAdmissionAgent?.status === "paused" || (await getRun(run.id))?.status !== "running") {
+          throw new Error("Process cleanup hold or cancelled run prevents adapter admission");
+        }
         adapterResult = await adapter.execute({
           runId: run.id,
           agent,
@@ -15987,6 +16032,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
             : undefined,
           runtimeMcp,
+          processAccounting: parseProcessAccountingPolicy(runtimeConfig.processAccounting),
           onLog,
           onMeta: onAdapterMeta,
           onEvent: onAdapterEvent,
@@ -15997,6 +16043,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           startupTraceContext: getStartupTraceContext(),
           onRuntimeProgress: async (progress) => {
             await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
+          },
+          onTimeout: async () => {
+            markProcessAdmissionHold(run.agentId, run.id);
+            await holdProcessCleanup(agent, run.id, "timeout_cleanup_requires_review");
           },
           onSpawn: async (meta) => {
             await persistRunProcessMetadata(run.id, {
@@ -16128,10 +16178,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
       let outcome: RunSessionOutcome;
+      await holdAccountedExecutionForReview(agent, run.id);
       const latestRun = await getRun(run.id);
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
         outcome = latestRun.status;
       } else if (adapterResult.timedOut) {
+        await holdProcessCleanup(agent, run.id, "timeout_cleanup_requires_review");
         outcome = "timed_out";
       } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
         outcome = "succeeded";
@@ -16448,6 +16500,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       );
     } catch (err) {
+      await holdAccountedExecutionForReview(agent, run.id);
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
@@ -16575,6 +16628,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
     } catch (outerErr) {
+          const accountedFailureAgent = await getAgent(run.agentId).catch(() => null);
+          if (accountedFailureAgent) await holdAccountedExecutionForReview(accountedFailureAgent, run.id);
           if (isWorkspaceBusyDeferral(outerErr)) {
             // Expected contention on a shared project workspace, not a
             // failure: park the run as a bounded scheduled retry and leave the
@@ -16770,7 +16825,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               });
             }
           }
+          const retained = getRetainedProcessEvidence(run.id);
+          let accountingPersisted = !retained;
+          if (retained) {
+            try {
+              const accounting = JSON.stringify({ processAccounting: retained.accounting });
+              const cleanup = JSON.stringify(retained.cleanup ? { processCleanup: retained.cleanup } : {});
+              await db.update(heartbeatRuns).set({
+                resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${accounting}::jsonb ||
+                  case when coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'processCleanup'
+                    then '{}'::jsonb else ${cleanup}::jsonb end`,
+                updatedAt: new Date(),
+              }).where(eq(heartbeatRuns.id, run.id));
+              forgetRetainedProcessEvidence(run.id);
+              accountingPersisted = true;
+            } catch (accountingError) {
+              logger.warn({ err: accountingError, runId: run.id }, "accounting evidence retained pending official persistence");
+            }
+          }
           activeRunExecutions.delete(run.id);
+          if (accountingPersisted) activeRunAgents.delete(run.id);
+          processAdmissionHolds.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
   }
@@ -16785,6 +16860,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgent = await getAgent(run.agentId);
     const recoveryAgentInvokable =
       recoveryAgent &&
+      !agentProcessAdmissionHolds.has(recoveryAgent.id) &&
+      !hasProcessCleanupHold(recoveryAgent) &&
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
       recoveryAgent.status !== "pending_approval";
@@ -18906,9 +18983,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
+    markProcessAdmissionHold(run.agentId, run.id);
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
-    const resultJson = agent
+    let resultJson = agent
       ? {
           ...mergeRunStopMetadataForAgent(agent, "cancelled", {
             resultJson: parseObject(run.resultJson),
@@ -18919,24 +18997,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       : options.resultJson;
 
+    if (agent && (isTrackedLocalChildProcessAdapter(agent.adapterType) || run.processPid || run.processGroupId || activeRunExecutions.has(run.id) || runningProcesses.has(run.id))) await holdProcessCleanup(agent, run.id, "cancellation_cleanup_requires_review");
+    // Stamp cancellation after durable admission hold and before the worker can
+    // race finalization. Release/promotion still waits for bounded cleanup.
+    await setRunStatus(run.id, "cancelled", { finishedAt: new Date(), error: reason, errorCode });
+    let cleanup: Record<string, unknown> = { scope: "sampled_pid_start_identity", state: "unknown", errors: ["tracker_unavailable"] };
     const running = runningProcesses.get(run.id);
     try {
       if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
+        if (running.containment) {
+          const observed = await running.containment.stop(Math.max(1, running.graceSec) * 1000);
+          cleanup = { ...observed };
+          running.finishStopped?.(observed);
+        }
+        // No tracker means ownership is unproven. Do not signal a bare PID/group.
+      } // No in-memory identity tracker: hold remains; never signal persisted PIDs.
+    } catch {
+      cleanup = { scope: "sampled_pid_start_identity", state: "unknown", errors: ["cleanup_exception"] };
     } finally {
       runningProcesses.delete(run.id);
     }
 
+    resultJson = { ...(resultJson ?? {}), processCleanup: cleanup };
     const finishedAt = new Date();
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt,
@@ -18958,13 +19040,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         message: options.eventMessage ?? "run cancelled",
         ...(options.eventPayload ? { payload: options.eventPayload } : {}),
       });
-      await releaseIssueExecutionAndPromote(cancelled);
+      await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
     }
 
     await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
     await startNextQueuedRunForAgent(run.agentId);
+    if (!activeRunExecutions.has(run.id)) processAdmissionHolds.delete(run.id);
     return cancelled;
   }
 
@@ -18976,39 +19059,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-        errorCode,
-        ...(agent ? {
-          resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
-            resultJson: parseObject(run.resultJson),
-            errorCode,
-            errorMessage: reason,
-          }),
-        } : {}),
-      });
-
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-      });
-
-      const running = runningProcesses.get(run.id);
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
-        runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
-      }
-      await releaseIssueExecutionAndPromote(run);
+      await cancelRunInternal(run.id, reason, { errorCode });
     }
 
     return runs.length;

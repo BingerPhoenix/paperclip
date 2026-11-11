@@ -13,8 +13,16 @@ type BuildInvocationEnvForLogsOptions = {
   resolvedCommandEnvKey?: string;
 };
 
-export const runningProcesses: Map<string, { child: ChildProcess; graceSec: number; processGroupId: number | null }> =
+export const runningProcesses: Map<string, serverUtils.RunningProcess> =
   serverUtils.runningProcesses;
+export const processAdmissionHolds = serverUtils.processAdmissionHolds;
+export const agentProcessAdmissionHolds = serverUtils.agentProcessAdmissionHolds;
+export const markProcessAdmissionHold = serverUtils.markProcessAdmissionHold;
+export const clearProcessAdmissionHold = serverUtils.clearProcessAdmissionHold;
+export const parseProcessAccountingPolicy = serverUtils.parseProcessAccountingPolicy;
+export const getLiveProcessAccounting = serverUtils.getLiveProcessAccounting;
+export const getRetainedProcessEvidence = serverUtils.getRetainedProcessEvidence;
+export const forgetRetainedProcessEvidence = serverUtils.forgetRetainedProcessEvidence;
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
 export const parseObject = serverUtils.parseObject;
@@ -87,6 +95,8 @@ export async function runChildProcess(
     timeoutSec: number;
     graceSec: number;
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    onTimeout?: () => Promise<void>;
+    processAccounting?: serverUtils.ProcessAccountingPolicy;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   },
 ): Promise<RunProcessResult> {

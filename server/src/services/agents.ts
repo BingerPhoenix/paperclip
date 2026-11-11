@@ -1,3 +1,9 @@
+import {
+  hasProcessCleanupHold, readProcessCleanupHold, releaseProcessCleanupHoldRequestSchema,
+  validateReviewedProcessCleanup, processCleanupEvidenceSha256, type ReleaseProcessCleanupHoldRequest,
+} from "./process-cleanup-hold.js";
+import { processSnapshot } from "@paperclipai/adapter-utils/process-containment";
+import { persistActivity, publishActivity } from "./activity-log.js";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -568,6 +574,112 @@ export function agentService(db: Db) {
     });
   }
 
+  async function releaseProcessCleanupHold(
+    id: string,
+    request: ReleaseProcessCleanupHoldRequest,
+    actor: { actorId: string; runtimeIdle?: () => boolean },
+  ) {
+    const parsed = releaseProcessCleanupHoldRequestSchema.safeParse(request);
+    if (!parsed.success || !actor.actorId.trim()) throw unprocessable("Invalid process cleanup hold release request");
+    const input = parsed.data;
+    if (!actor.runtimeIdle?.()) throw conflict("Agent runtime work prevents cleanup release");
+    let result;
+    try {
+      result = await db.transaction(async (tx) => {
+        // A brief write barrier prevents work-state phantoms through COMMIT.
+        // It is not a repository lock and does not forbid future privileged writes.
+        await tx.execute(sql`set local lock_timeout = '2s'`);
+        await tx.execute(sql`set local statement_timeout = '5s'`);
+        await tx.execute(sql`lock table heartbeat_runs, agent_wakeup_requests in share mode`);
+        const existing = await tx.select().from(agents).where(eq(agents.id, id)).for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!existing) throw notFound("Agent not found");
+        const hold = readProcessCleanupHold(existing.metadata);
+        if (hold.holdId !== input.expectedHoldId || hold.runId !== input.expectedRunId) {
+          throw conflict("Process cleanup hold changed; refresh the official evidence");
+        }
+        if (existing.status !== "paused") throw conflict("Process cleanup release requires a paused agent");
+        if (existing.adapterType === "codex_local" && existing.adapterConfig.engine !== "cli") {
+          throw conflict("Only explicitly qualified native Codex CLI cleanup can be released");
+        }
+        const run = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, input.expectedRunId), eq(heartbeatRuns.agentId, id),
+          eq(heartbeatRuns.companyId, existing.companyId),
+        )).for("update").then((rows) => rows[0] ?? null);
+        if (!run || !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)
+            || !run.finishedAt) throw conflict("A terminal official run is required for cleanup review");
+        const [work, wakes] = await Promise.all([
+          tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.agentId, id),
+            sql`${heartbeatRuns.status} not in ('succeeded','failed','cancelled','timed_out','interrupted')`,
+          )).limit(1),
+          tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.agentId, id),
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
+          )).limit(1),
+        ]);
+        if (work.length || wakes.length) throw conflict("Queued or active agent work prevents cleanup release");
+        let snapshot: ReturnType<typeof processSnapshot>;
+        try { snapshot = processSnapshot(); }
+        catch { throw conflict("Fresh process identity verification is unavailable"); }
+        if (!snapshot.length) throw conflict("Fresh process identity verification is unavailable");
+        const officialResult = run.resultJson as Record<string, unknown> | null;
+        const officialCleanup = officialResult?.processCleanup as Record<string, unknown> | undefined;
+        if ((hold.accountingRequired === true || existing.adapterConfig.processAccounting !== undefined
+          || officialResult?.processAccounting !== undefined) && (
+          !officialResult?.processAccounting || processCleanupEvidenceSha256(officialResult.processAccounting)
+            !== processCleanupEvidenceSha256(officialCleanup?.accounting)
+        )) throw conflict("Final official accounting must match the reviewed cleanup evidence");
+        validateReviewedProcessCleanup({
+          cleanup: (run.resultJson as Record<string, unknown> | null)?.processCleanup,
+          expectedRunId: input.expectedRunId,
+          reviewedCleanupEvidenceSha256: input.reviewedCleanupEvidenceSha256,
+          processPid: run.processPid, adapterType: existing.adapterType, snapshot,
+        });
+        const metadata = { ...(existing.metadata ?? {}) };
+        delete metadata.processCleanupHold;
+        const runtimeConfig = { ...(existing.runtimeConfig ?? {}) };
+        const heartbeat = runtimeConfig.heartbeat;
+        runtimeConfig.heartbeat = {
+          ...(heartbeat && typeof heartbeat === "object" && !Array.isArray(heartbeat) ? heartbeat : {}),
+          enabled: false, intervalSec: 0, wakeOnDemand: false,
+        };
+        if (!actor.runtimeIdle?.()) throw conflict("Agent runtime work prevents cleanup release");
+        const updated = await tx.update(agents).set({
+          metadata, runtimeConfig, status: "paused", updatedAt: new Date(),
+        }).where(and(eq(agents.id, id),
+          sql`${agents.metadata}->'processCleanupHold'->>'holdId' = ${input.expectedHoldId}`,
+          sql`${agents.metadata}->'processCleanupHold'->>'runId' = ${input.expectedRunId}`,
+        )).returning({ id: agents.id }).then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("Process cleanup hold changed during release");
+        const audit = await persistActivity(tx as unknown as Db, {
+          companyId: existing.companyId, actorType: "user", actorId: actor.actorId,
+          action: "agent.process_cleanup_hold.released", entityType: "agent", entityId: id,
+          agentId: id, runId: input.expectedRunId,
+          details: { releasedHoldId: input.expectedHoldId, releasedRunId: input.expectedRunId,
+            cleanupEvidenceSha256: input.reviewedCleanupEvidenceSha256, reviewNote: input.reviewNote },
+        });
+        if (!actor.runtimeIdle?.()) throw conflict("Agent runtime work changed during cleanup release");
+        return {
+          response: {
+            agent: { id, status: "paused" as const,
+              heartbeat: { enabled: false as const, intervalSec: 0 as const, wakeOnDemand: false as const } },
+            releasedHoldId: input.expectedHoldId, releasedRunId: input.expectedRunId,
+            cleanupEvidenceSha256: input.reviewedCleanupEvidenceSha256,
+          }, publication: audit.publication,
+        };
+      });
+    } catch (error) {
+      const databaseError = error as { code?: string; cause?: { code?: string } };
+      if (["55P03", "57014", "40001", "40P01"].includes(databaseError.code ?? databaseError.cause?.code ?? "")) {
+        throw conflict("Cleanup release could not obtain a stable work state; reconcile before retrying");
+      }
+      throw error;
+    }
+    publishActivity(result.publication);
+    return result.response;
+  }
+
   async function updateAgent(
     id: string,
     data: Partial<typeof agents.$inferInsert>,
@@ -576,6 +688,10 @@ export function agentService(db: Db) {
     const existing = await getById(id);
     if (!existing) return null;
 
+    if (hasProcessCleanupHold(existing) && (
+      (data.status !== undefined && data.status !== "paused" && data.status !== "terminated") ||
+      (Object.prototype.hasOwnProperty.call(data, "metadata") && JSON.stringify((data.metadata as Record<string, unknown> | null)?.processCleanupHold) !== JSON.stringify((existing.metadata as Record<string, unknown>).processCleanupHold))
+    )) throw conflict("Process cleanup requires explicit operator review; the hold cannot be cleared through ordinary agent updates");
     if (existing.status === "terminated" && data.status && data.status !== "terminated") {
       throw conflict("Terminated agents cannot be resumed");
     }
@@ -652,10 +768,10 @@ export function agentService(db: Db) {
       const updated = await txDb
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), sql`not (coalesce(${agents.metadata}, '{}'::jsonb) ? 'processCleanupHold')`))
         .returning()
         .then((rows) => rows[0] ?? null);
-      if (!updated) return null;
+      if (!updated) throw conflict("Agent update blocked by concurrent process cleanup hold; refresh and review");
 
       if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
         if (bindingDecision) {
@@ -781,6 +897,7 @@ export function agentService(db: Db) {
     },
 
     update: updateAgent,
+    releaseProcessCleanupHold,
 
     pause: async (id: string, reason: "manual" | "budget" | "system" = "manual") => {
       const existing = await getById(id);
@@ -805,6 +922,7 @@ export function agentService(db: Db) {
     resume: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (hasProcessCleanupHold(existing)) throw conflict("Process cleanup requires explicit operator review before resume");
       if (existing.status === "terminated") throw conflict("Cannot resume terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot be resumed");
@@ -819,15 +937,17 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), sql`not (coalesce(${agents.metadata}, '{}'::jsonb) ? 'processCleanupHold')`))
         .returning()
         .then((rows) => rows[0] ?? null);
-      return updated ? getById(updated.id) : null;
+      if (!updated) throw conflict("Agent mutation blocked by concurrent process cleanup hold; refresh and review");
+      return getById(updated.id);
     },
 
     clearError: async (id: string) => {
       const existing = await getById(id);
       if (!existing) return null;
+      if (hasProcessCleanupHold(existing)) throw conflict("Process cleanup requires explicit operator review before clearing errors");
       if (existing.status === "terminated") throw conflict("Cannot clear error on terminated agent");
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot have errors cleared");
@@ -845,7 +965,7 @@ export function agentService(db: Db) {
           errorReason: null,
           updatedAt: new Date(),
         })
-        .where(and(eq(agents.id, id), eq(agents.status, "error")))
+        .where(and(eq(agents.id, id), eq(agents.status, "error"), sql`not (coalesce(${agents.metadata}, '{}'::jsonb) ? 'processCleanupHold')`))
         .returning()
         .then((rows) => rows[0] ?? null);
 

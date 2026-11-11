@@ -67,6 +67,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     graceSec,
     onLog,
     onSpawn: ctx.onSpawn,
+    onTimeout: ctx.onTimeout,
+    processAccounting: ctx.processAccounting,
   });
 
   if (proc.timedOut) {
@@ -75,6 +77,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: proc.signal,
       timedOut: true,
       errorMessage: `Timed out after ${timeoutSec}s`,
+      resultJson: { processCleanup: proc.processCleanup ?? {state: "unknown", scope: "sampled_pid_start_identity"} },
     };
   }
 

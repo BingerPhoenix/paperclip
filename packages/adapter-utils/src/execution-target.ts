@@ -172,6 +172,8 @@ export interface AdapterExecutionTargetProcessOptions {
   graceSec: number;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
+  onTimeout?: () => Promise<void>;
+  processAccounting?: Omit<import("./process-accounting.js").ProcessAccountingOptions, "baseline">;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   terminalResultCleanup?: TerminalResultCleanupOptions;
   /**
@@ -677,6 +679,8 @@ export async function runAdapterExecutionTargetProcess(
     graceSec: options.graceSec,
     onLog: options.onLog,
     onSpawn: options.onSpawn,
+    onTimeout: options.onTimeout,
+    processAccounting: options.processAccounting,
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),

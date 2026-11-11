@@ -30,6 +30,8 @@ import { summarySlotRoutes } from "./routes/summary-slots.js";
 import { statusCardRoutes } from "./routes/status-cards.js";
 import { teamsCatalogRoutes } from "./routes/teams-catalog.js";
 import { agentRoutes } from "./routes/agents.js";
+import { clearProcessAdmissionHold } from "./adapters/utils.js";
+import { isProcessCleanupRuntimeIdle } from "./services/heartbeat.js";
 import type { SetupTokenSessionService } from "./services/setup-token-session.js";
 import {
   buildSetupTokenLoginTransport,
@@ -487,6 +489,9 @@ export async function createApp(
   });
   api.use(
     agentRoutes(db, {
+      onProcessCleanupHoldReleased: ({ agentId, holdId, runId }) =>
+        clearProcessAdmissionHold(agentId, { holdId, runId }),
+      isProcessCleanupRuntimeIdle,
       pluginWorkerManager: workerManager,
       deploymentMode: opts.deploymentMode,
       confidentialProxyAllowlist: setupTokenLoginProxyAllowlist,

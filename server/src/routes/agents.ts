@@ -1,3 +1,5 @@
+import { hasProcessCleanupHold, releaseProcessCleanupHoldRequestSchema } from "../services/process-cleanup-hold.js";
+import { getLiveProcessAccounting } from "../adapters/utils.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -226,6 +228,9 @@ export function agentRoutes(
   db: Db,
   options: {
     pluginWorkerManager?: PluginWorkerManager;
+    /** Root runtime wiring clears only the released generation's ephemeral fences. */
+    isProcessCleanupRuntimeIdle?: (agentId: string) => boolean;
+    onProcessCleanupHoldReleased?: (release: { agentId: string; holdId: string; runId: string }) => boolean;
     /** The active deployment mode. The confidential transport guard reads it. */
     deploymentMode?: DeploymentMode;
     /**
@@ -3944,6 +3949,45 @@ export function agentRoutes(
     res.json(agent);
   });
 
+  router.post("/agents/:id/process-cleanup-hold/release", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!(await getAccessibleAgent(req, res, id))) return;
+    if (!options.onProcessCleanupHoldReleased || !options.isProcessCleanupRuntimeIdle) {
+      res.status(503).json({ error: "Process cleanup release runtime wiring is unavailable" });
+      return;
+    }
+    const input = releaseProcessCleanupHoldRequestSchema.safeParse(req.body);
+    if (!input.success) {
+      res.status(400).json({ error: "Invalid process cleanup hold release request" });
+      return;
+    }
+    if (!options.isProcessCleanupRuntimeIdle(id)) {
+      res.status(409).json({ error: "Agent runtime work prevents cleanup release" });
+      return;
+    }
+    const released = await svc.releaseProcessCleanupHold(id, input.data, {
+      actorId: req.actor.userId ?? "board", runtimeIdle: () => options.isProcessCleanupRuntimeIdle!(id),
+    });
+    const cleared = options.onProcessCleanupHoldReleased({
+      agentId: id, holdId: released.releasedHoldId, runId: released.releasedRunId,
+    });
+    if (!cleared) {
+      const current = await svc.getById(id);
+      const heartbeat = readObject(readObject(current?.runtimeConfig)?.heartbeat) ?? {};
+      res.status(409).json({
+        error: "A newer process cleanup fence exists; reconcile the current hold",
+        releasedHoldId: released.releasedHoldId, releasedRunId: released.releasedRunId,
+        agent: { id, status: current?.status ?? "unknown",
+          heartbeat: { enabled: heartbeat.enabled === true, intervalSec: heartbeat.intervalSec ?? null,
+            wakeOnDemand: heartbeat.wakeOnDemand === true },
+          processCleanupHoldPresent: hasProcessCleanupHold(current) },
+      });
+      return;
+    }
+    res.json(released);
+  });
+
   router.post("/agents/:id/resume", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
@@ -3955,6 +3999,10 @@ export function agentRoutes(
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before resuming it",
       });
+      return;
+    }
+    if (hasProcessCleanupHold(existing)) {
+      res.status(409).json({ error: "Process cleanup requires explicit operator review before resume" });
       return;
     }
     const agent = await svc.resume(id);
@@ -4937,6 +4985,16 @@ export function agentRoutes(
       ...heartbeat.decorateActiveRunStatus(run),
       outputSilence: await heartbeat.buildRunOutputSilence(run),
     }))));
+  });
+
+  router.get("/heartbeat-runs/:runId/process-accounting", async (req, res) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!run) return;
+    const live = getLiveProcessAccounting(runId);
+    const stored = readObject(run.resultJson)?.processAccounting ?? readObject(readObject(run.resultJson)?.processCleanup)?.accounting ?? null;
+    res.json({ runId, phase: live ? "live" : stored ? "terminal" : "unavailable", accounting: live ?? stored });
   });
 
   router.get("/heartbeat-runs/:runId", async (req, res) => {
